@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-98fd63e4.js";
+            window.path_to_searchindex_js = "searchindex-69be7e59.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7c233cc9.js"></script>
+        <script src="toc-b5966016.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -206,9 +206,20 @@
 cd ngx_l402
 </code></pre>
 <ol start="2">
-<li>Build the module:</li>
+<li>Download Nginx source and build the module:</li>
 </ol>
-<pre><code class="language-bash">cargo build --release --features export-modules
+<blockquote>
+<p>⚠️ <strong>Important</strong>: You must download the exact Nginx source code matching your target version and set the <code>NGINX_SOURCE_DIR</code> environment variable before building.</p>
+</blockquote>
+<pre><code class="language-bash"># Example for Nginx 1.28.0
+curl -fsSL http://nginx.org/download/nginx-1.28.0.tar.gz -o nginx.tar.gz
+tar -xzf nginx.tar.gz
+cd nginx-1.28.0
+./configure --with-compat
+cd ..
+export NGINX_SOURCE_DIR=$(pwd)/nginx-1.28.0
+
+cargo build --release --features export-modules
 </code></pre>
 <p>The compiled module will be at <code>target/release/libngx_l402_lib.so</code>.</p>
 <ol start="3">

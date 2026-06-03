@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-98fd63e4.js";
+            window.path_to_searchindex_js = "searchindex-69be7e59.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7c233cc9.js"></script>
+        <script src="toc-b5966016.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -316,9 +316,13 @@ endpoint. It serves counters in text exposition format v0.0.4.</p>
 <tr><td><code>l402_requests_total</code></td><td>Every request that entered the access handler with <code>l402 on;</code>. Incremented for both enforce and shadow traffic.</td></tr>
 <tr><td><code>l402_challenges_issued_total</code></td><td>Requests that received a <code>402</code> response (enforce mode), counted <em>after</em> the rate-limit gate.</td></tr>
 <tr><td><code>l402_rate_limited_total</code></td><td>Requests rejected with <code>429</code> by <code>l402_invoice_rate_limit</code> (enforce mode).</td></tr>
-<tr><td><code>l402_payments_valid_total</code></td><td>Authorization headers that verified successfully (enforce mode only — dry-run traffic goes to <code>l402_dry_run_*</code>).</td></tr>
+<tr><td><code>l402_payments_valid_total</code></td><td>Authorization headers that verified successfully — Lightning + Cashu (enforce mode only — dry-run traffic goes to <code>l402_dry_run_*</code>).</td></tr>
+<tr><td><code>l402_payments_lightning_total</code></td><td>Successful payments settled via a Lightning macaroon (classic preimage <em>or</em> auto-detect).</td></tr>
+<tr><td><code>l402_payments_cashu_total</code></td><td>Successful payments settled via a Cashu token redemption.</td></tr>
 <tr><td><code>l402_payments_invalid_total</code></td><td>Authorization headers that failed verification (enforce mode only).</td></tr>
 <tr><td><code>l402_payments_missing_total</code></td><td>Requests without an Authorization header (enforce mode only).</td></tr>
+<tr><td><code>l402_invoices_generated_total</code></td><td>Lightning invoices successfully generated for L402 challenges (enforce mode only).</td></tr>
+<tr><td><code>l402_invoices_generation_errors_total</code></td><td>Failures generating a Lightning invoice during challenge synthesis (returns <code>500</code>).</td></tr>
 <tr><td><code>l402_dry_run_requests_total</code></td><td>Requests handled in shadow mode.</td></tr>
 <tr><td><code>l402_dry_run_would_block_total</code></td><td>Shadow-mode requests that <em>would</em> have been blocked (<code>401</code> or <code>402</code>).</td></tr>
 <tr><td><code>l402_dry_run_would_allow_total</code></td><td>Shadow-mode requests that <em>would</em> have been allowed (<code>200</code>).</td></tr>
@@ -377,6 +381,9 @@ disables enforcement without touching upstream code paths.</p>
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
+                            <a rel="next prefetch" href="manifest.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -388,6 +395,9 @@ disables enforcement without touching upstream code paths.</p>
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
+                    <a rel="next prefetch" href="manifest.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
             </nav>
 
         </div>
