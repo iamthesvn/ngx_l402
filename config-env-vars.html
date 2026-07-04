@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-69be7e59.js";
+            window.path_to_searchindex_js = "searchindex-42a9c4d7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-b5966016.js"></script>
@@ -233,25 +233,69 @@ Environment=BOLT12_OFFER=lno1...
 Environment=CLN_LIGHTNING_RPC_FILE_PATH=/path/to/lightning-rpc
 Environment=ROOT_KEY=your-root-key
 </code></pre>
+<blockquote>
+<p><strong>How it works</strong>: When a client requests a protected resource, the module
+connects to your <strong>CLN node</strong> via the Unix socket at <code>CLN_LIGHTNING_RPC_FILE_PATH</code>
+and calls <code>fetchinvoice</code> to derive a fresh single-use <strong>BOLT11 invoice</strong> from
+the reusable BOLT12 offer. The node resolves the offer’s embedded node ID and
+negotiates the payment parameters over the Lightning network automatically.
+<code>CLN_LIGHTNING_RPC_FILE_PATH</code> is therefore <strong>required</strong> alongside <code>BOLT12_OFFER</code>.</p>
+</blockquote>
 <h2 id="eclair"><a class="header" href="#eclair">Eclair</a></h2>
 <pre><code class="language-bash">Environment=LN_CLIENT_TYPE=ECLAIR
 Environment=ECLAIR_ADDRESS=http://127.0.0.1:8282
-Environment=ECLAIR_PASSWORD=eclairpass
+Environment=ECLAIR_PASSWORD=eclairpass   # REQUIRED — no default; module disables auto-detect if unset
 Environment=ROOT_KEY=your-root-key
 </code></pre>
+<blockquote>
+<p><strong>⚠️ Security</strong>: <code>ECLAIR_PASSWORD</code> is <strong>required</strong> and has no default value.
+If it is not set the Eclair payment-detector is disabled at startup and an
+error is logged. Never use a well-known or placeholder password in production.</p>
+</blockquote>
 <hr>
 <h2 id="redis-dynamic-pricing--replay-protection"><a class="header" href="#redis-dynamic-pricing--replay-protection">Redis (Dynamic Pricing &amp; Replay Protection)</a></h2>
+<blockquote>
+<p><strong>Strongly recommended in production.</strong> Without Redis, replay protection uses
+in-process caching only — it is lost on restart and does not work across
+multiple nginx workers. Multi-worker deployments <strong>require</strong> Redis.</p>
+</blockquote>
 <pre><code class="language-bash">Environment=REDIS_URL=redis://127.0.0.1:6379
 
-# TTL for replay attack prevention (default: 86400 = 24 hours)
+# Connection pool size (default: 4)
+Environment=REDIS_POOL_SIZE=4
+
+# TTL for spent Lightning preimages (default: 86400 = 24 hours)
 Environment=L402_PREIMAGE_TTL_SECONDS=86400
+
+# TTL for spent Cashu tokens (default: 86400 = 24 hours)
 Environment=L402_CASHU_TOKEN_TTL_SECONDS=86400
 </code></pre>
+<h3 id="setting-ttl-to-infinite-permanent-replay-protection"><a class="header" href="#setting-ttl-to-infinite-permanent-replay-protection">Setting TTL to “infinite” (permanent replay protection)</a></h3>
+<p>The module stores spent preimages and Cashu tokens in Redis using
+<code>SET NX EX &lt;seconds&gt;</code>. Redis requires a positive integer for <code>EX</code> — there is
+no built-in “never expire” option via this command.</p>
+<p>To achieve <strong>permanent</strong> replay protection (strongly recommended in production),
+set the TTL to a very large value:</p>
+<pre><code class="language-bash"># ~68 years — effectively permanent
+Environment=L402_PREIMAGE_TTL_SECONDS=2147483647
+Environment=L402_CASHU_TOKEN_TTL_SECONDS=2147483647
+</code></pre>
+<blockquote>
+<p><strong>Trade-off</strong>: Permanent keys accumulate in Redis indefinitely. For a busy
+API with many unique tokens this will grow Redis memory over time. Size each
+key at ~100 bytes; 1 million spent tokens ≈ 100 MB.</p>
+<p><strong>Do not set <code>0</code></strong> — Redis rejects <code>EX 0</code> with an error, which causes the
+module to fail-open and skip the replay check entirely.</p>
+</blockquote>
 <hr>
 <h2 id="cashu-ecash"><a class="header" href="#cashu-ecash">Cashu eCash</a></h2>
 <pre><code class="language-bash">Environment=CASHU_ECASH_SUPPORT=true
 Environment=CASHU_DB_PATH=/var/lib/nginx/cashu_tokens.db
-Environment=CASHU_WALLET_SECRET=&lt;your-secret-random-string&gt;
+# BIP39 wallet mnemonic (the Cashu/NUT-13 backup phrase). Leave unset to have one
+# generated and saved next to the DB on first run (check the logs for the phrase).
+Environment=CASHU_WALLET_MNEMONIC="word1 word2 ... word12"
+# Optional: where to persist a generated mnemonic (defaults beside the DB file)
+# Environment=CASHU_WALLET_MNEMONIC_FILE=/var/lib/nginx/wallet.mnemonic
 
 # Optional: Whitelist specific mints (comma-separated)
 # In standard mode: if not set, all mints are accepted
@@ -263,12 +307,12 @@ Environment=CASHU_REDEEM_ON_LIGHTNING=true
 Environment=CASHU_REDEMPTION_INTERVAL_SECS=3600  # default: 1 hour
 </code></pre>
 <blockquote>
-<p><strong>⚠️ Security</strong>: <code>CASHU_WALLET_SECRET</code> is used to generate the wallet seed. Anyone with this secret can steal your tokens!</p>
+<p><strong>⚠️ Security</strong>: <code>CASHU_WALLET_MNEMONIC</code> is the BIP39 phrase that derives the wallet seed (NUT-13). It is the only backup of your wallet — anyone with it can steal your tokens, and losing it loses the funds!</p>
 <ul>
-<li>Generate with: <code>openssl rand -hex 32</code></li>
-<li>Never commit to Git</li>
-<li>Use a different value per deployment/environment</li>
-<li>Keep it in a secure environment variable or secrets manager</li>
+<li>12 or 24 English words; restorable in any NUT-13 wallet (nutshell, cashu-ts, cdk-cli)</li>
+<li>If unset, one is generated and saved beside the DB on first run — <strong>back it up</strong></li>
+<li>On startup the module records a fingerprint of the seed next to the DB and refuses to start if a later mnemonic doesn’t match (so a changed/typo’d phrase can’t silently orphan a funded wallet); delete the <code>wallet.fingerprint</code> file to switch wallets intentionally</li>
+<li>Never commit it to Git; keep it in a secrets manager</li>
 </ul>
 </blockquote>
 <h3 id="redemption-fee-handling"><a class="header" href="#redemption-fee-handling">Redemption Fee Handling</a></h3>
@@ -291,21 +335,76 @@ Environment=CASHU_MAX_PROOFS_PER_MELT=1000
 Environment=CASHU_P2PK_PRIVATE_KEY=&lt;your-private-key-hex&gt;
 # Public key is derived automatically from the private key
 # CASHU_WHITELISTED_MINTS is REQUIRED in P2PK mode
+Environment=CASHU_REQUIRE_DLEQ=true   # default: true — keep it on
 </code></pre>
 <blockquote>
 <p><strong>⚠️ Security</strong>: <code>CASHU_P2PK_PRIVATE_KEY</code> is equally critical. Anyone with this key can spend tokens locked to your public key!</p>
 <ul>
 <li>Generate with: <code>openssl rand -hex 32</code></li>
 <li>Never commit to Git or share publicly</li>
-<li>Keep it secure alongside <code>CASHU_WALLET_SECRET</code></li>
+<li>Keep it secure alongside <code>CASHU_WALLET_MNEMONIC</code></li>
+</ul>
+</blockquote>
+<blockquote>
+<p><strong>🔒 NUT-12 DLEQ (<code>CASHU_REQUIRE_DLEQ</code>)</strong>: In P2PK mode, tokens are verified
+on a fast path that <strong>skips the mint swap</strong> for lower latency. DLEQ proofs
+(NUT-12) are what let us confirm offline — using only cached mint keysets —
+that each proof was actually signed by the whitelisted mint. With this check
+off, a forger could submit correctly-shaped, mint-whitelisted proofs that the
+mint never signed and get free service (the operator only finds out at
+redemption time, when the melt fails).</p>
+<ul>
+<li><strong>Default <code>true</code></strong>: a proof with no DLEQ data is rejected. Modern Cashu
+wallets include DLEQ by default, so this is safe.</li>
+<li>Set <code>CASHU_REQUIRE_DLEQ=false</code> only as a temporary safety valve if a
+real-world wallet ships DLEQ-less tokens. This is <strong>insecure</strong> and re-opens
+the forged-proof window above.</li>
+<li>The standard (non-P2PK) mode is unaffected: its mint swap already validates
+proofs authoritatively.</li>
+</ul>
+</blockquote>
+<blockquote>
+<p><strong>🔒 NUT-12 DLEQ (<code>CASHU_REQUIRE_DLEQ</code>)</strong>: In P2PK mode, tokens are verified
+on a fast path that <strong>skips the mint swap</strong> for lower latency. DLEQ proofs
+(NUT-12) are what let us confirm offline — using only cached mint keysets —
+that each proof was actually signed by the whitelisted mint. With this check
+off, a forger could submit correctly-shaped, mint-whitelisted proofs that the
+mint never signed and get free service (the operator only finds out at
+redemption time, when the melt fails).</p>
+<ul>
+<li><strong>Default <code>true</code></strong>: a proof with no DLEQ data is rejected. Modern Cashu
+wallets include DLEQ by default, so this is safe.</li>
+<li>Set <code>CASHU_REQUIRE_DLEQ=false</code> only as a temporary safety valve if a
+real-world wallet ships DLEQ-less tokens. This is <strong>insecure</strong> and re-opens
+the forged-proof window above.</li>
+<li>The standard (non-P2PK) mode is unaffected: its mint swap already validates
+proofs authoritatively.</li>
 </ul>
 </blockquote>
 <p>See <a href="./cashu.html">Cashu eCash</a> for a full explanation of Standard vs P2PK mode and redemption fee examples.</p>
+<hr>
+<h2 id="lnd-via-socks5--tor-proxy"><a class="header" href="#lnd-via-socks5--tor-proxy">LND via SOCKS5 / Tor proxy</a></h2>
+<pre><code class="language-bash"># [Optional] Route LND gRPC through a SOCKS5 proxy
+Environment=SOCKS5_PROXY=socks5://127.0.0.1:9050
+</code></pre>
+<hr>
+<h2 id="capability-manifest-metadata"><a class="header" href="#capability-manifest-metadata">Capability Manifest Metadata</a></h2>
+<p>These optional variables populate the <code>service</code> block in <code>/.well-known/l402-services</code>.
+All are omitted from the manifest JSON when unset.</p>
+<pre><code class="language-bash">Environment=L402_SERVICE_NAME=My API
+Environment=L402_SERVICE_DESCRIPTION=Premium data, paid per request.
+Environment=L402_SERVICE_OPERATOR=npub1...   # Nostr pubkey, DID, or free-form
+Environment=L402_SERVICE_CONTACT=ops@example.com
+</code></pre>
+<p>See <a href="./manifest.html">Capability Manifest</a> for the full manifest spec.</p>
 <hr>
 <h2 id="logging"><a class="header" href="#logging">Logging</a></h2>
 <pre><code class="language-bash">Environment=RUST_LOG=info
 # For module-specific debug logs:
 Environment=RUST_LOG=ngx_l402_lib=debug,info
+
+# Log per-request performance timing (set to any non-empty value to enable)
+Environment=L402_PERF_LOG=1
 </code></pre>
 <hr>
 <h2 id="nginx-location-directives"><a class="header" href="#nginx-location-directives">Nginx Location Directives</a></h2>
@@ -322,6 +421,7 @@ Environment=RUST_LOG=ngx_l402_lib=debug,info
 <tr><td><code>l402_lnurl_addr</code></td><td>string</td><td>—</td><td>Per-location LNURL address for multi-tenant setups</td></tr>
 <tr><td><code>l402_invoice_rate_limit</code></td><td><code>&lt;N&gt;r/m</code> or <code>&lt;N&gt;r/s</code></td><td>disabled</td><td>Max invoice generation rate per IP per route</td></tr>
 <tr><td><code>l402_auto_detect_payment</code></td><td>boolean¹</td><td><code>off</code></td><td>Server-side payment detection — queries the Lightning node instead of requiring the client to supply the preimage</td></tr>
+<tr><td><code>l402_indefinite_access</code></td><td>boolean¹</td><td><code>off</code></td><td>Skip the single-use preimage replay check — a single payment stays valid for the macaroon lifetime</td></tr>
 </tbody>
 </table>
 </div>
@@ -338,6 +438,21 @@ Environment=RUST_LOG=ngx_l402_lib=debug,info
     try_files /index.html =404;
 }
 </code></pre>
+<h3 id="example-subscription-style-indefinite-access"><a class="header" href="#example-subscription-style-indefinite-access">Example: subscription-style (indefinite) access</a></h3>
+<pre><code class="language-nginx">location /subscriber-only {
+    l402                         on;
+    l402_amount_msat_default     100000;
+    l402_macaroon_timeout        2592000;  # 30 days
+    l402_indefinite_access       on;       # single payment stays valid until macaroon expires
+
+    try_files /index.html =404;
+}
+</code></pre>
+<blockquote>
+<p><strong>Warning</strong>: <code>l402_indefinite_access on</code> should always be paired with a non-zero
+<code>l402_macaroon_timeout</code>. Without an expiry, the macaroon never expires and the
+same preimage grants access forever.</p>
+</blockquote>
 <blockquote>
 <p><strong>Backends that support auto-detect</strong>: <code>LND</code>, <code>CLN</code>, <code>BOLT12</code>, <code>ECLAIR</code>.
 <code>LNC</code>, <code>NWC</code>, and <code>LNURL</code> do <strong>not</strong> support server-side lookup.</p>
