@@ -77,7 +77,7 @@ fn require_root_key() -> Vec<u8> {
 }
 
 /// Registry of l402-enabled locations, populated at config-parse time and
-/// drained at `.well-known/l402-services` request time. Each entry holds the
+/// read at `.well-known/l402-services` request time. Each entry holds the
 /// location's path and a raw pointer to its `ModuleConfig` — the config
 /// lives in nginx's cycle pool, so the pointer remains valid until the
 /// next reload, at which point a fresh worker process is started with a
