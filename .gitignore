@@ -3,8 +3,10 @@
 /grpc-server/target
 /grpc-server/.env
 /book
-docs/mermaid.min.js
-docs/mermaid-init.js
+# mermaid assets are installed by `mdbook-mermaid install` (CI does this every
+# docs build) — never commit them, wherever they land
+mermaid.min.js
+mermaid-init.js
 .DS_Store
 .cargo/config.toml
 .claude/
