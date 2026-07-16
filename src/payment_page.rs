@@ -121,8 +121,8 @@ pub fn render_payment_page(
         }}).then(r => {{
             if (r.ok || r.status === 200) {{
                 document.getElementById('auto-status').innerHTML =
-                    '<span style="color:var(--success)">✓ Payment confirmed! Redirecting…</span>';
-                setTimeout(() => window.location.reload(), 800);
+                    '<span style="color:var(--success)">✓ Payment confirmed! Loading…</span>';
+                setTimeout(() => showContent(r), 800);
             }} else {{
                 setTimeout(startPolling, 3000);
             }}
@@ -313,6 +313,9 @@ document.getElementById('preimage-section').classList.remove('hidden')\">Enter p
       t.style.opacity = '1'; setTimeout(() => t.style.opacity = '0', 2000);
     }});
   }}
+  function showContent(r) {{
+    r.text().then(html => {{ document.open(); document.write(html); document.close(); }});
+  }}
   function submitPreimage() {{
     const hex = document.getElementById('preimage-input').value.trim();
     const errEl = document.getElementById('preimage-error');
@@ -327,7 +330,7 @@ document.getElementById('preimage-section').classList.remove('hidden')\">Enter p
       headers: {{'Authorization': 'L402 ' + MACAROON + ':' + hex}},
       redirect: 'follow', credentials: 'same-origin'
     }}).then(r => {{
-      if (r.ok || r.status === 200) {{ window.location.reload(); }}
+      if (r.ok || r.status === 200) {{ showContent(r); }}
       else {{
         errEl.textContent = 'Payment verification failed (status ' + r.status + '). Check your preimage.';
         errEl.classList.remove('hidden'); btn.textContent = 'Submit Payment'; btn.disabled = false;
@@ -351,7 +354,7 @@ document.getElementById('preimage-section').classList.remove('hidden')\">Enter p
       headers: {{'Authorization': 'Cashu ' + token}},
       redirect: 'follow', credentials: 'same-origin'
     }}).then(r => {{
-      if (r.ok || r.status === 200) {{ window.location.reload(); }}
+      if (r.ok || r.status === 200) {{ showContent(r); }}
       else {{
         errEl.textContent = 'Token verification failed (status ' + r.status + ').';
         errEl.classList.remove('hidden'); btn.textContent = 'Submit Token'; btn.disabled = false;
