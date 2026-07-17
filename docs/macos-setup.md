@@ -13,8 +13,8 @@ This guide is for contributors running `ngx_l402` locally on macOS.
 ## 2. Clone and enter the repository
 
 ```bash
-git clone https://github.com/DhananjayPurohit/ngx_l402.git
-cd ngx_l402
+git clone https://github.com/ngx-l402/ngx-l402.git
+cd ngx-l402
 ```
 
 ## 3. Start the stack

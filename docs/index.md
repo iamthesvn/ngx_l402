@@ -66,7 +66,7 @@ docker run -d \
   -e LN_CLIENT_TYPE=LNURL \
   -e LNURL_ADDRESS=username@your-lnurl-server.com \
   -e ROOT_KEY=your-32-byte-hex-key \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 Then test it:
