@@ -3,7 +3,7 @@
 The easiest way to deploy the L402 Nginx module is with our official Docker images.
 
 ```bash
-docker pull ghcr.io/dhananjaypurohit/ngx_l402:latest
+docker pull ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ---
@@ -19,7 +19,7 @@ docker run -d \
   -e LN_CLIENT_TYPE=LNURL \
   -e LNURL_ADDRESS=username@your-lnurl-server.com \
   -e ROOT_KEY=your-32-byte-hex-key \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ### 2. LND Backend with Cashu Support
@@ -43,7 +43,7 @@ docker run -d \
   -e CASHU_REDEEM_ON_LIGHTNING=true \
   -e REDIS_URL=redis://redis:6379 \
   -v ~/l402-data:/app/data \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ### 3. LND via Lightning Node Connect (LNC)
@@ -59,7 +59,7 @@ docker run -d \
   -e LNC_PAIRING_PHRASE="word1 word2 word3 word4 word5 word6 word7 word8 word9 word10" \
   -e LNC_MAILBOX_SERVER=mailbox.terminal.lightning.today:443 \
   -e ROOT_KEY=your-32-byte-hex-key \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ### 4. CLN Backend (Core Lightning)
@@ -75,7 +75,7 @@ docker run -d \
   -e CASHU_WALLET_MNEMONIC="word1 word2 ... word12" \
   -e CASHU_DB_PATH=/app/data/cashu_tokens.db \
   -v ~/.lightning/bitcoin/lightning-rpc:/app/data/lightning-rpc:ro \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ### 5. NWC Backend (Nostr Wallet Connect)
@@ -87,7 +87,7 @@ docker run -d \
   -e LN_CLIENT_TYPE=NWC \
   -e NWC_URI=nostr+walletconnect://your-pubkey?relay=wss://relay.damus.io&secret=your-secret \
   -e ROOT_KEY=your-32-byte-hex-key \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ### 6. High-Performance P2PK Mode (Recommended for Production)
@@ -109,7 +109,7 @@ docker run -d \
   -e CASHU_REDEEM_ON_LIGHTNING=true \
   -e REDIS_URL=redis://redis:6379 \
   -v ~/l402-data:/app/data \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ### 7. BOLT12 Backend (Reusable Offers)
@@ -123,7 +123,7 @@ docker run -d \
   -e CLN_LIGHTNING_RPC_FILE_PATH=/app/data/lightning-rpc \
   -e ROOT_KEY=your-32-byte-hex-key \
   -v ~/.lightning/bitcoin/lightning-rpc:/app/data/lightning-rpc:ro \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ### 8. Eclair Backend
@@ -136,7 +136,7 @@ docker run -d \
   -e ECLAIR_ADDRESS=http://your-eclair-node:8282 \
   -e ECLAIR_PASSWORD=your-eclair-password \
   -e ROOT_KEY=your-32-byte-hex-key \
-  ghcr.io/dhananjaypurohit/ngx_l402:latest
+  ghcr.io/ngx-l402/ngx-l402:latest
 ```
 
 ---
@@ -178,5 +178,8 @@ docker stop l402-nginx
 ## Specific Versions
 
 ```bash
+docker pull ghcr.io/ngx-l402/ngx-l402:v1.2.8
+
+# Releases up to v1.2.7 were published under the previous namespace:
 docker pull ghcr.io/dhananjaypurohit/ngx_l402:v1.2.5
 ```

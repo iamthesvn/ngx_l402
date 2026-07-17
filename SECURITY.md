@@ -34,7 +34,7 @@ Report privately using one of the following, in order of preference:
 
 1. **GitHub Private Vulnerability Reporting** (preferred)
    Open a report at
-   <https://github.com/DhananjayPurohit/ngx_l402/security/advisories/new>.
+   <https://github.com/ngx-l402/ngx-l402/security/advisories/new>.
    This keeps the report visible only to maintainers and lets us coordinate
    a fix and advisory in the same place.
 2. **Direct contact with the maintainer**

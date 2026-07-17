@@ -286,7 +286,7 @@ document.getElementById('preimage-section').classList.remove('hidden')\">Enter p
   </div>
   {cashu_tab_html}
   <div class="footer">
-    Secured by <a href="https://github.com/DhananjayPurohit/ngx_l402" target="_blank" rel="noopener">ngx_l402</a> &#183; L402 Protocol
+    Secured by <a href="https://github.com/ngx-l402/ngx-l402" target="_blank" rel="noopener">ngx_l402</a> &#183; L402 Protocol
   </div>
 </div>
 <script>

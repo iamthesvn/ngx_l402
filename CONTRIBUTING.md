@@ -11,6 +11,7 @@ Thank you for your interest in contributing to ngx_l402! This guide will help yo
 - [Coding Standards](#coding-standards)
 - [Testing Guidelines](#testing-guidelines)
 - [Performance Testing](#performance-testing)
+- [Submitting a Pull Request (GitHub + Nostr)](#submitting-a-pull-request-github--nostr)
 - [Pull Request Process](#pull-request-process)
 - [Architecture Guidelines](#architecture-guidelines)
 
@@ -49,7 +50,7 @@ We welcome various types of contributions:
 
 ### Finding Issues to Work On
 
-- Browse [open issues](https://github.com/DhananjayPurohit/ngx_l402/issues)
+- Browse [open issues](https://github.com/ngx-l402/ngx-l402/issues)
 - Look for `good-first-issue` or `help-wanted` labels if you are new.
 - Check performance optimization issues (especially post-stress testing)
 - Improve areas where documentation is unclear
@@ -290,6 +291,87 @@ Example PR description:
 
 ---
 
+## Submitting a Pull Request (GitHub + Nostr)
+
+This project is hosted on **both GitHub and [Nostr](https://gitworkshop.dev)**.
+
+**First PR? Just pick whichever door you already know. Contributing regularly? Please post
+to both.** Don't let the dual setup stop you from contributing — a PR on either side is
+always welcome, and maintainers will bridge the gap when needed.
+
+| | GitHub (classic) | Nostr (ngit) |
+|---|---|---|
+| Need an account | GitHub account | Nostr keypair (nsec) |
+| Fork required | Yes | No |
+| CI runs automatically | Yes | After a maintainer mirrors it |
+
+### Option A — GitHub (easiest if you already have a GitHub account)
+
+```bash
+# Fork + clone (origin = your fork, upstream = this repo)
+gh repo fork ngx-l402/ngx-l402 --clone
+cd ngx-l402
+
+git checkout -b fix/my-change
+# ...make changes, commit...
+git push -u origin fix/my-change
+
+gh pr create --repo ngx-l402/ngx-l402 --base main \
+  --title "fix: my change" --body "what and why"
+```
+
+### Option B — Nostr (no fork, no GitHub account needed)
+
+```bash
+# One-time: install ngit and log in with your Nostr identity
+curl -Ls https://ngit.dev/install.sh | bash
+ngit login
+
+# Clone straight from Nostr (clone URL is on the gitworkshop.dev repo page)
+git clone nostr://npub1qnw27f2jsqvn05wzpd56m7ykgmepk57p0yrzw8fzc7lfhjkmjmqqmd9r6h/ngx-l402
+cd ngx-l402
+
+# Branch MUST use the pr/ prefix
+git checkout -b pr/my-change
+# ...make changes, commit...
+
+# This push IS the PR — it publishes a proposal to gitworkshop.dev
+git push -o 'title=fix: my change' -o 'description=what and why' -u origin pr/my-change
+```
+
+### Option C — both (preferred for regular contributors)
+
+Do the GitHub setup from Option A, then add the Nostr remote once:
+
+```bash
+git remote add nostr nostr://npub1qnw27f2jsqvn05wzpd56m7ykgmepk57p0yrzw8fzc7lfhjkmjmqqmd9r6h/ngx-l402
+```
+
+Then, from a single `pr/`-prefixed branch, push to both:
+
+```bash
+git checkout -b pr/my-change
+# ...make changes, commit...
+
+# 1) GitHub PR
+git push -u origin pr/my-change
+gh pr create --repo ngx-l402/ngx-l402 --base main \
+  --title "fix: my change" --body "what and why"
+
+# 2) Nostr PR — same branch, same title/description
+git push -o 'title=fix: my change' -o 'description=what and why' nostr pr/my-change
+```
+
+Use identical title and description on both, and link each PR to the other in its
+description. **To revise after review**, commit and push the branch again to both remotes —
+both PRs update in place.
+
+> **Maintainers:** merge locally with `git merge --no-ff` and push `main` through the Nostr
+> remote — never use GitHub's squash/merge button. Preserving the original commit SHAs is
+> what lets both the GitHub PR and the Nostr proposal close themselves automatically.
+
+---
+
 ## Pull Request Process
 
 ### Pre-Submission Checklist
@@ -337,7 +419,7 @@ Closes #issue_number
 2. **Maintainer review**: Code quality, design, safety
 3. **Discussion**: Address feedback and questions
 4. **Approval**: One maintainer approval required
-5. **Merge**: Squash and merge to `main`
+5. **Merge**: Merged to `main` preserving commits (`git merge --no-ff`), so both the GitHub PR and Nostr proposal close automatically
 
 ### After Your PR is Merged
 
@@ -398,7 +480,7 @@ When adding features, consider:
 ## Getting Help
 
 - 📖 **Documentation**: See [README.md](README.md)
-- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/DhananjayPurohit/ngx_l402/issues)
+- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/ngx-l402/ngx-l402/issues)
 - 📚 **Learning Resources**:
   - [Rust Book](https://doc.rust-lang.org/book/)
   - [L402 Protocol](https://docs.lightning.engineering/the-lightning-network/l402)

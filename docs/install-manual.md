@@ -6,7 +6,7 @@
 
 ### 1. Download the Module
 
-Download `libngx_l402_lib.so` from the [latest release](https://github.com/DhananjayPurohit/ngx_l402/releases/latest) and copy it to your Nginx modules directory:
+Download `libngx_l402_lib.so` from the [latest release](https://github.com/ngx-l402/ngx-l402/releases/latest) and copy it to your Nginx modules directory:
 
 ```bash
 sudo cp libngx_l402_lib.so /etc/nginx/modules/

@@ -30,8 +30,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/DhananjayPurohit/ngx_l402.git
-cd ngx_l402
+git clone https://github.com/ngx-l402/ngx-l402.git
+cd ngx-l402
 ```
 
 2. Download Nginx source and build the module:
