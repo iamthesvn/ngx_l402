@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ngx-l402/ngx-l402.org
-          ssh-key: ${{ secrets.SITE_DEPLOY_KEY }}
+          token: ${{ secrets.SITE_DEPLOY_KEY }}   # fine-grained PAT, Contents: read+write on the website repo
           path: site
 
       - name: Sync built docs to website repo
