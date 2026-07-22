@@ -8,15 +8,16 @@ use macaroon::Verifier;
 use ngx::core::Buffer;
 use ngx::ffi::{
     nginx_version, ngx_array_push, ngx_chain_t, ngx_command_t, ngx_conf_t, ngx_cycle_s,
-    ngx_http_discard_request_body, ngx_http_handler_pt, ngx_http_module_t,
-    ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_request_t, ngx_int_t, ngx_log_s, ngx_module_t,
-    ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc, ngx_slab_pool_t, ngx_str_t, ngx_uint_t,
-    NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_DECLINED, NGX_ERROR, NGX_HTTP_COPY, NGX_HTTP_DELETE,
-    NGX_HTTP_GET, NGX_HTTP_HEAD, NGX_HTTP_INTERNAL_SERVER_ERROR, NGX_HTTP_LOCK, NGX_HTTP_LOC_CONF,
-    NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MKCOL, NGX_HTTP_MODULE, NGX_HTTP_MOVE,
-    NGX_HTTP_NOT_ALLOWED, NGX_HTTP_OPTIONS, NGX_HTTP_PATCH, NGX_HTTP_POST, NGX_HTTP_PROPFIND,
-    NGX_HTTP_PROPPATCH, NGX_HTTP_PUT, NGX_HTTP_SRV_CONF, NGX_HTTP_TRACE, NGX_HTTP_UNLOCK,
-    NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_WARN, NGX_OK, NGX_RS_MODULE_SIGNATURE,
+    ngx_http_discard_request_body, ngx_http_finalize_request, ngx_http_handler_pt,
+    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_request_t, ngx_int_t,
+    ngx_log_s, ngx_module_t, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc,
+    ngx_slab_pool_t, ngx_str_t, ngx_uint_t, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_DECLINED,
+    NGX_DONE, NGX_ERROR, NGX_HTTP_COPY, NGX_HTTP_DELETE, NGX_HTTP_GET, NGX_HTTP_HEAD,
+    NGX_HTTP_INTERNAL_SERVER_ERROR, NGX_HTTP_LOCK, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
+    NGX_HTTP_MAIN_CONF, NGX_HTTP_MKCOL, NGX_HTTP_MODULE, NGX_HTTP_MOVE, NGX_HTTP_NOT_ALLOWED,
+    NGX_HTTP_OPTIONS, NGX_HTTP_PATCH, NGX_HTTP_POST, NGX_HTTP_PROPFIND, NGX_HTTP_PROPPATCH,
+    NGX_HTTP_PUT, NGX_HTTP_SRV_CONF, NGX_HTTP_TRACE, NGX_HTTP_UNLOCK, NGX_LOG_ERR, NGX_LOG_INFO,
+    NGX_LOG_WARN, NGX_OK, NGX_RS_MODULE_SIGNATURE,
 };
 use ngx::http::{
     HTTPStatus, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf,
@@ -1369,7 +1370,16 @@ unsafe fn send_html_response(r: *mut ngx_http_request_t, status: u16, body: Stri
         return send_status.0 as isize;
     }
 
-    unsafe { req.output_filter(&mut *chain).0 as isize }
+    let rc = unsafe { req.output_filter(&mut *chain).0 };
+    // Finalize the request and return NGX_DONE. Returning the raw output_filter
+    // result (NGX_OK on success) from an ACCESS-phase handler means "access
+    // granted — continue to the content phase", i.e. proxy_pass: the module would
+    // both write this response AND forward the request upstream, so an unpaid
+    // request intermittently leaked to the backend ("header already sent", then a
+    // stall until the upstream read timeout → 502) — a paywall fail-open.
+    // NGX_DONE tells the phase engine we have taken ownership of the request.
+    unsafe { ngx_http_finalize_request(r, rc) };
+    NGX_DONE as isize
 }
 
 // Per-worker scratch slot used by `l402_access_handler` to report *which*
