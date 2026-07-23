@@ -12,6 +12,7 @@ Thank you for your interest in contributing to ngx_l402! This guide will help yo
 - [Testing Guidelines](#testing-guidelines)
 - [Performance Testing](#performance-testing)
 - [Submitting a Pull Request (GitHub + Nostr)](#submitting-a-pull-request-github--nostr)
+- [Reporting Issues (GitHub + Nostr)](#reporting-issues-github--nostr)
 - [Pull Request Process](#pull-request-process)
 - [Architecture Guidelines](#architecture-guidelines)
 
@@ -66,7 +67,9 @@ Include in your bug report:
 - **Logs**: Relevant error messages (sanitize secrets!)
 - **Configuration**: Nginx config (remove sensitive data)
 
-Use the GitHub issue template when creating a new bug report.
+Use the GitHub issue template when creating a new bug report. No GitHub account?
+See [Reporting Issues (GitHub + Nostr)](#reporting-issues-github--nostr) — you can
+file on the Nostr side instead.
 
 ### Suggesting Features
 
@@ -369,6 +372,23 @@ both PRs update in place.
 > **Maintainers:** merge locally with `git merge --no-ff` and push `main` through the Nostr
 > remote — never use GitHub's squash/merge button. Preserving the original commit SHAs is
 > what lets both the GitHub PR and the Nostr proposal close themselves automatically.
+
+---
+
+## Reporting Issues (GitHub + Nostr)
+
+Issues work like PRs in that either side is welcome — but unlike PRs, **there is no
+need to file on both**. Maintainers mirror issues across, which is why the same
+reports show up on both trackers and gitworkshop issues carry their GitHub numbers.
+
+| You have | File here | Notes |
+|---|---|---|
+| A GitHub account | [GitHub issues](https://github.com/ngx-l402/ngx-l402/issues) | The canonical tracker. Triage happens here and issue numbers come from here. |
+| Only a Nostr identity (Option B) | The repo page on [gitworkshop.dev](https://gitworkshop.dev) | Fully supported — you never need a GitHub account just to report a bug. |
+
+**Why the Nostr tracker is a real channel, not decoration:** the GitHub organisation
+has twice been hidden by automated flagging. While that is in effect, nobody can file
+or read issues on GitHub at all. The gitworkshop tracker stays reachable regardless.
 
 ---
 
