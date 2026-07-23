@@ -4,8 +4,18 @@
 /// `WWW-Authenticate` header value of the form:
 ///   `L402 macaroon="<b64>", invoice="<bolt11>"`
 pub fn parse_l402_header_value(header: &str) -> Option<(String, String)> {
-    let mac = header.split("macaroon=\"").nth(1)?.split('"').next()?.to_string();
-    let inv = header.split("invoice=\"").nth(1)?.split('"').next()?.to_string();
+    let mac = header
+        .split("macaroon=\"")
+        .nth(1)?
+        .split('"')
+        .next()?
+        .to_string();
+    let inv = header
+        .split("invoice=\"")
+        .nth(1)?
+        .split('"')
+        .next()?
+        .to_string();
     Some((mac, inv))
 }
 

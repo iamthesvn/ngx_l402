@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn seed_is_64_bytes() {
-        assert_eq!(derive_wallet_seed(VECTOR_MNEMONIC).unwrap().len(), WALLET_SEED_LEN);
+        assert_eq!(
+            derive_wallet_seed(VECTOR_MNEMONIC).unwrap().len(),
+            WALLET_SEED_LEN
+        );
     }
 
     #[test]
@@ -165,7 +168,10 @@ mod tests {
     /// Fresh mnemonics must not repeat — proves the RNG is actually exercised.
     #[test]
     fn generated_mnemonics_are_unique() {
-        assert_ne!(generate_mnemonic(12).unwrap(), generate_mnemonic(12).unwrap());
+        assert_ne!(
+            generate_mnemonic(12).unwrap(),
+            generate_mnemonic(12).unwrap()
+        );
     }
 
     #[test]
@@ -193,8 +199,7 @@ mod tests {
     #[test]
     fn distinct_seeds_have_distinct_fingerprints() {
         let a = derive_wallet_seed(VECTOR_MNEMONIC).unwrap();
-        let other =
-            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let other = "legal winner thank year wave sausage worth useful legal winner thank yellow";
         let b = derive_wallet_seed(other).unwrap();
         assert_ne!(wallet_fingerprint(&a), wallet_fingerprint(&b));
     }

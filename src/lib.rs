@@ -1,5 +1,6 @@
 use env_logger;
 use hex;
+use l402_middleware::lndrpc::lnrpc;
 use l402_middleware::middleware::L402Middleware;
 use l402_middleware::{bolt12, cln, eclair, l402, lnclient, lnd, lnurl, macaroon_util, nwc, utils};
 use log::{debug, error, info, warn};
@@ -9,17 +10,16 @@ use ngx::ffi::{
     nginx_version, ngx_array_push, ngx_chain_t, ngx_command_t, ngx_conf_t, ngx_cycle_s,
     ngx_http_discard_request_body, ngx_http_handler_pt, ngx_http_module_t,
     ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_request_t, ngx_int_t, ngx_log_s, ngx_module_t,
-    ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc, ngx_slab_pool_t,
-    ngx_str_t, ngx_uint_t, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_DECLINED, NGX_ERROR, NGX_HTTP_COPY,
-    NGX_HTTP_DELETE, NGX_HTTP_GET, NGX_HTTP_HEAD, NGX_HTTP_INTERNAL_SERVER_ERROR, NGX_HTTP_LOCK,
-    NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MKCOL, NGX_HTTP_MODULE, NGX_HTTP_MOVE,
+    ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc, ngx_slab_pool_t, ngx_str_t, ngx_uint_t,
+    NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_DECLINED, NGX_ERROR, NGX_HTTP_COPY, NGX_HTTP_DELETE,
+    NGX_HTTP_GET, NGX_HTTP_HEAD, NGX_HTTP_INTERNAL_SERVER_ERROR, NGX_HTTP_LOCK, NGX_HTTP_LOC_CONF,
+    NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MKCOL, NGX_HTTP_MODULE, NGX_HTTP_MOVE,
     NGX_HTTP_NOT_ALLOWED, NGX_HTTP_OPTIONS, NGX_HTTP_PATCH, NGX_HTTP_POST, NGX_HTTP_PROPFIND,
     NGX_HTTP_PROPPATCH, NGX_HTTP_PUT, NGX_HTTP_SRV_CONF, NGX_HTTP_TRACE, NGX_HTTP_UNLOCK,
-    NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_WARN, NGX_OK,
-    NGX_RS_MODULE_SIGNATURE,
+    NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_WARN, NGX_OK, NGX_RS_MODULE_SIGNATURE,
 };
 use ngx::http::{
-    HttpModule, HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf, HTTPStatus,
+    HTTPStatus, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf,
     Merge, MergeConfigError, NgxHttpCoreModule, Request,
 };
 use ngx::{ngx_log_error, ngx_string};
@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
-use l402_middleware::lndrpc::lnrpc;
 
 mod cashu;
 mod cashu_redemption_logger;
@@ -291,7 +290,10 @@ fn handle_preimage_claim(result: Result<bool, ReplayClaimError>) -> isize {
             NGX_DECLINED as isize
         }
         Err(ReplayClaimError::Unavailable(e)) => {
-            error!("❌ Redis unavailable for preimage claim — rejecting to prevent replay: {}", e);
+            error!(
+                "❌ Redis unavailable for preimage claim — rejecting to prevent replay: {}",
+                e
+            );
             503
         }
     }
@@ -416,13 +418,19 @@ pub fn release_cashu_token(token: &str) {
     let mut conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
-            warn!("⚠️ Could not release Cashu replay claim (no Redis conn): {}", e);
+            warn!(
+                "⚠️ Could not release Cashu replay claim (no Redis conn): {}",
+                e
+            );
             return;
         }
     };
     let redis_key = cashu_token_redis_key(token);
     if let Err(e) = redis::cmd("DEL").arg(&redis_key).query::<i64>(&mut *conn) {
-        warn!("⚠️ Failed to release Cashu replay claim {}: {}", redis_key, e);
+        warn!(
+            "⚠️ Failed to release Cashu replay claim {}: {}",
+            redis_key, e
+        );
     }
 }
 
@@ -463,7 +471,10 @@ pub fn cache_settled_preimage(payment_hash: &[u8], preimage: &[u8]) -> Result<()
     conn.set_ex::<_, _, ()>(&redis_key, preimage_hex, ttl_seconds)
         .map_err(|e| format!("Failed to cache settled preimage: {}", e))?;
 
-    info!("✅ Cached settled preimage for payment_hash {}", &hash_hex[..16]);
+    info!(
+        "✅ Cached settled preimage for payment_hash {}",
+        &hash_hex[..16]
+    );
     Ok(())
 }
 
@@ -486,7 +497,7 @@ pub fn extract_payment_hash_from_auth_str(auth_str: &str) -> Result<Vec<u8>, Str
         .map_err(|e| format!("Failed to deserialize macaroon: {}", e))?;
 
     // The identifier holds the raw payment-hash bytes (usually 32 bytes).
-    // We extract the raw hash here for the node lookup by stripping the leading 
+    // We extract the raw hash here for the node lookup by stripping the leading
     // 0xff sentinel if the identifier length is 33 bytes.
     let id_bytes = mac.identifier().0.clone();
 
@@ -502,7 +513,7 @@ pub fn extract_payment_hash_from_auth_str(auth_str: &str) -> Result<Vec<u8>, Str
             .copied()
             .skip_while(|&b| b == 0xff)
             .collect();
-        
+
         if stripped.len() == 32 {
             stripped
         } else {
@@ -954,7 +965,8 @@ impl HttpModule for L402Module {
 
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
         info!("🚀 Initializing L402 module handler");
-        let cmcf: *mut ngx::ffi::ngx_http_core_main_conf_t = NgxHttpCoreModule::main_conf_mut(&*cf).expect("http core main conf") as *mut _;
+        let cmcf: *mut ngx::ffi::ngx_http_core_main_conf_t =
+            NgxHttpCoreModule::main_conf_mut(&*cf).expect("http core main conf") as *mut _;
         let h = ngx_array_push(
             &mut (*cmcf).phases[ngx_http_phases_NGX_HTTP_ACCESS_PHASE as usize].handlers,
         ) as *mut ngx_http_handler_pt;
@@ -1152,7 +1164,8 @@ pub static mut NGX_HTTP_L402_COMMANDS: [ngx_command_t; 12] = [
     },
     ngx_command_t {
         name: ngx_string!("l402_auto_detect_payment"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1)
+            as ngx_uint_t,
         set: Some(ngx_http_l402_auto_detect_payment_set),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
@@ -1286,7 +1299,6 @@ impl Merge for ModuleConfig {
     }
 }
 
-
 /// Map nginx's `r->method` bitmask to the canonical uppercase string used in
 /// the `RequestMethod` macaroon caveat. Falls back to `"UNKNOWN"` for methods
 /// nginx didn't recognise; both sides of the protocol see the same fallback,
@@ -1359,7 +1371,6 @@ unsafe fn send_html_response(r: *mut ngx_http_request_t, status: u16, body: Stri
 
     unsafe { req.output_filter(&mut *chain).0 as isize }
 }
-
 
 // Per-worker scratch slot used by `l402_access_handler` to report *which*
 // payment method satisfied a successful verification. The wrapper consumes it
@@ -1574,9 +1585,7 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
                 Some(PaymentMethod::Lightning) => {
                     metrics::inc(metrics::Metric::PaymentsLightningTotal)
                 }
-                Some(PaymentMethod::Cashu) => {
-                    metrics::inc(metrics::Metric::PaymentsCashuTotal)
-                }
+                Some(PaymentMethod::Cashu) => metrics::inc(metrics::Metric::PaymentsCashuTotal),
                 None => {}
             }
         }
@@ -1849,67 +1858,67 @@ pub fn l402_access_handler(
                 };
 
                 // 3. Resolve preimage: Redis cache → node lookup
-                let preimage_bytes: Vec<u8> =
-                    if let Some(cached) = get_cached_settled_preimage(&payment_hash) {
-                        debug!("💾 Using cached settled preimage");
-                        cached
-                    } else {
-                        // Use a lazily initialized static runtime
-                        static AUTODETECT_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-                        let rt = AUTODETECT_RUNTIME.get_or_init(|| {
-                            match tokio::runtime::Builder::new_multi_thread()
-                                .enable_all()
-                                .build()
-                            {
-                                Ok(rt) => rt,
-                                Err(e) => {
-                                    eprintln!("FATAL: failed to create autodetect runtime: {}", e);
-                                    std::process::abort();
-                                }
+                let preimage_bytes: Vec<u8> = if let Some(cached) =
+                    get_cached_settled_preimage(&payment_hash)
+                {
+                    debug!("💾 Using cached settled preimage");
+                    cached
+                } else {
+                    // Use a lazily initialized static runtime
+                    static AUTODETECT_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+                    let rt = AUTODETECT_RUNTIME.get_or_init(|| {
+                        match tokio::runtime::Builder::new_multi_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                eprintln!("FATAL: failed to create autodetect runtime: {}", e);
+                                std::process::abort();
                             }
-                        });
+                        }
+                    });
 
-                        match payment_detector::PAYMENT_DETECTOR.get() {
-                            Some(detector) => {
-                                const AUTODETECT_LOOKUP_TIMEOUT: Duration =
-                                    Duration::from_secs(5);
-                                match rt.block_on(async {
-                                    tokio::time::timeout(
-                                        AUTODETECT_LOOKUP_TIMEOUT,
-                                        detector.lookup_settled_invoice(&payment_hash),
-                                    )
-                                    .await
-                                }) {
-                                    Ok(Ok(Some(p))) => {
-                                        // Cache for future requests
-                                        if let Err(e) = cache_settled_preimage(&payment_hash, &p) {
-                                            warn!("⚠️ Failed to cache settled preimage: {}", e);
-                                        }
-                                        p
+                    match payment_detector::PAYMENT_DETECTOR.get() {
+                        Some(detector) => {
+                            const AUTODETECT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+                            match rt.block_on(async {
+                                tokio::time::timeout(
+                                    AUTODETECT_LOOKUP_TIMEOUT,
+                                    detector.lookup_settled_invoice(&payment_hash),
+                                )
+                                .await
+                            }) {
+                                Ok(Ok(Some(p))) => {
+                                    // Cache for future requests
+                                    if let Err(e) = cache_settled_preimage(&payment_hash, &p) {
+                                        warn!("⚠️ Failed to cache settled preimage: {}", e);
                                     }
-                                    Ok(Ok(None)) => {
-                                        info!("⏳ Invoice not yet settled — returning 402");
-                                        return 402;
-                                    }
-                                    Ok(Err(e)) => {
-                                        error!("❌ Node invoice lookup failed: {}", e);
-                                        return 500;
-                                    }
-                                    Err(_) => {
-                                        warn!(
+                                    p
+                                }
+                                Ok(Ok(None)) => {
+                                    info!("⏳ Invoice not yet settled — returning 402");
+                                    return 402;
+                                }
+                                Ok(Err(e)) => {
+                                    error!("❌ Node invoice lookup failed: {}", e);
+                                    return 500;
+                                }
+                                Err(_) => {
+                                    warn!(
                                             "Auto-detect invoice lookup timed out after {}s — returning 402",
                                             AUTODETECT_LOOKUP_TIMEOUT.as_secs()
                                         );
-                                        return 402;
-                                    }
+                                    return 402;
                                 }
                             }
-                            None => {
-                                error!("❌ PAYMENT_DETECTOR not initialised");
-                                return 500;
-                            }
                         }
-                    };
+                        None => {
+                            error!("❌ PAYMENT_DETECTOR not initialised");
+                            return 500;
+                        }
+                    }
+                };
 
                 // 4. Check replay (skipped when indefinite access is enabled).
                 if !indefinite_access && is_preimage_used(&preimage_bytes) {
@@ -2424,12 +2433,7 @@ fn handle_dry_run_passthrough(
         let header_result = rt.block_on(async {
             tokio::time::timeout(
                 DRY_RUN_CHALLENGE_TIMEOUT,
-                module.get_l402_header(
-                    caveats,
-                    final_amount,
-                    macaroon_timeout,
-                    final_lnurl_addr,
-                ),
+                module.get_l402_header(caveats, final_amount, macaroon_timeout, final_lnurl_addr),
             )
             .await
         });
@@ -2606,7 +2610,10 @@ pub unsafe extern "C" fn ngx_http_l402_indefinite_access_set(
         {
             conf.indefinite_access = false;
         } else {
-            error!("Invalid l402_indefinite_access value: '{}' (expected on/off)", val);
+            error!(
+                "Invalid l402_indefinite_access value: '{}' (expected on/off)",
+                val
+            );
             return b"l402_indefinite_access: expected 'on' or 'off'\0".as_ptr() as *mut c_char;
         }
     }
@@ -2622,9 +2629,10 @@ pub unsafe extern "C" fn ngx_http_l402_metrics_set(
     // `ngx_http_conf_get_module_loc_conf` requires a valid module reference.
     // `ngx_http_core_module` is a static global defined by nginx core.
     unsafe {
-        let clcf: *mut ngx::ffi::ngx_http_core_loc_conf_t = NgxHttpCoreModule::location_conf_mut(&*cf)
-            .map(|r| r as *mut _)
-            .unwrap_or(std::ptr::null_mut());
+        let clcf: *mut ngx::ffi::ngx_http_core_loc_conf_t =
+            NgxHttpCoreModule::location_conf_mut(&*cf)
+                .map(|r| r as *mut _)
+                .unwrap_or(std::ptr::null_mut());
         if clcf.is_null() {
             return b"l402_metrics: missing core loc conf\0".as_ptr() as *mut c_char;
         }
@@ -2649,9 +2657,10 @@ pub unsafe extern "C" fn ngx_http_l402_manifest_set(
 ) -> *mut c_char {
     // SAFETY: same guarantees as `ngx_http_l402_metrics_set` above.
     unsafe {
-        let clcf: *mut ngx::ffi::ngx_http_core_loc_conf_t = NgxHttpCoreModule::location_conf_mut(&*cf)
-            .map(|r| r as *mut _)
-            .unwrap_or(std::ptr::null_mut());
+        let clcf: *mut ngx::ffi::ngx_http_core_loc_conf_t =
+            NgxHttpCoreModule::location_conf_mut(&*cf)
+                .map(|r| r as *mut _)
+                .unwrap_or(std::ptr::null_mut());
         if clcf.is_null() {
             return b"l402_manifest: missing core loc conf\0".as_ptr() as *mut c_char;
         }
@@ -2786,7 +2795,11 @@ pub unsafe extern "C" fn ngx_http_l402_set(
         let conf = &mut *conf_ptr;
         let args = (*(*cf).args).elts as *mut ngx_str_t;
 
-        let val = (*args.add(1)).to_str().unwrap_or_default().trim().to_lowercase();
+        let val = (*args.add(1))
+            .to_str()
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
 
         match val.as_str() {
             "on" | "true" | "1" | "yes" => {
@@ -2800,10 +2813,7 @@ pub unsafe extern "C" fn ngx_http_l402_set(
                     if let Ok(mut reg) = manifest_registry().lock() {
                         // Skip dup entries — `l402 on;` could appear more
                         // than once in pathological configs.
-                        if !reg
-                            .iter()
-                            .any(|r| r.path == path && r.conf.0 == conf_ptr)
-                        {
+                        if !reg.iter().any(|r| r.path == path && r.conf.0 == conf_ptr) {
                             reg.push(RouteRegistration {
                                 path,
                                 conf: ConfPtr(conf_ptr),
@@ -2928,7 +2938,8 @@ pub unsafe extern "C" fn ngx_http_l402_lnurl_set(
                 Ok(env_val) if !env_val.is_empty() => env_val,
                 _ => {
                     error!("❌ LNURL_ADDRESS environment variable is not set and no value provided in config");
-                    return b"LNURL_ADDRESS environment variable is not set\0".as_ptr() as *mut c_char;
+                    return b"LNURL_ADDRESS environment variable is not set\0".as_ptr()
+                        as *mut c_char;
                 }
             }
         };
@@ -2957,7 +2968,12 @@ fn get_client_ip(request: *mut ngx_http_request_t) -> String {
 
         // X-Real-IP: single IP set by a trusted reverse proxy
         if !r.headers_in.x_real_ip.is_null() {
-            let val = (*r.headers_in.x_real_ip).value.to_str().unwrap_or_default().trim().to_string();
+            let val = (*r.headers_in.x_real_ip)
+                .value
+                .to_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if !val.is_empty() {
                 return val;
             }
@@ -2965,7 +2981,10 @@ fn get_client_ip(request: *mut ngx_http_request_t) -> String {
 
         // X-Forwarded-For: "client, proxy1, proxy2" — leftmost is the origin
         if !r.headers_in.x_forwarded_for.is_null() {
-            let val_str = (*r.headers_in.x_forwarded_for).value.to_str().unwrap_or_default();
+            let val_str = (*r.headers_in.x_forwarded_for)
+                .value
+                .to_str()
+                .unwrap_or_default();
             if let Some(ip) = val_str.split(',').next() {
                 let ip = ip.trim();
                 if !ip.is_empty() {
@@ -3055,7 +3074,9 @@ pub unsafe extern "C" fn ngx_http_l402_invoice_rate_limit_set(
                 as *mut c_char;
         }
         let conf = &mut *(conf as *mut ModuleConfig);
-        let val = (*((*(*cf).args).elts as *mut ngx_str_t).add(1)).to_str().unwrap_or_default();
+        let val = (*((*(*cf).args).elts as *mut ngx_str_t).add(1))
+            .to_str()
+            .unwrap_or_default();
         match ngx_l402_core::parse_rate_limit(val) {
             Some((max_req, window_secs)) => {
                 conf.invoice_rate_limit = Some((max_req, window_secs));
@@ -3081,7 +3102,11 @@ pub unsafe extern "C" fn ngx_http_l402_auto_detect_payment_set(
     unsafe {
         let conf = &mut *(conf as *mut ModuleConfig);
         let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let val = (*args.add(1)).to_str().unwrap_or_default().trim().to_lowercase();
+        let val = (*args.add(1))
+            .to_str()
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
 
         match val.as_str() {
             "on" | "true" | "1" | "yes" => {
@@ -3093,7 +3118,10 @@ pub unsafe extern "C" fn ngx_http_l402_auto_detect_payment_set(
                 info!("⚙️ Disabled L402 auto-detect payment for this location");
             }
             _ => {
-                error!("❌ Invalid auto_detect_payment configuration value: {}", val);
+                error!(
+                    "❌ Invalid auto_detect_payment configuration value: {}",
+                    val
+                );
                 return std::ptr::null_mut();
             }
         }

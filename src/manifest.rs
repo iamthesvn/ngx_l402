@@ -210,4 +210,3 @@ fn route_block(r: &RouteSnapshot) -> Value {
 
     Value::Object(block)
 }
-
