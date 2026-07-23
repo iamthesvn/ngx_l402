@@ -19,7 +19,6 @@ use std::sync::OnceLock;
 use tonic;
 use tonic_openssl_lnd::lnrpc;
 
-
 /// The configured detector (one instance for the lifetime of the worker).
 pub static PAYMENT_DETECTOR: OnceLock<PaymentDetector> = OnceLock::new();
 
@@ -54,8 +53,7 @@ impl PaymentDetector {
 
 /// Called once from `init_module`.  Reads env vars and builds the detector.
 pub fn init_payment_detector() {
-    let ln_client_type =
-        std::env::var("LN_CLIENT_TYPE").unwrap_or_else(|_| "LNURL".to_string());
+    let ln_client_type = std::env::var("LN_CLIENT_TYPE").unwrap_or_else(|_| "LNURL".to_string());
 
     let detector = match ln_client_type.as_str() {
         "LND" => {
@@ -66,16 +64,13 @@ pub fn init_payment_detector() {
                     reason: "LNC mailbox does not expose LookupInvoice".into(),
                 }
             } else {
-                let address = std::env::var("LND_ADDRESS")
-                    .unwrap_or_else(|_| "localhost:10009".to_string());
+                let address =
+                    std::env::var("LND_ADDRESS").unwrap_or_else(|_| "localhost:10009".to_string());
                 let macaroon_file = std::env::var("MACAROON_FILE_PATH")
                     .unwrap_or_else(|_| "admin.macaroon".to_string());
-                let cert_file = std::env::var("CERT_FILE_PATH")
-                    .unwrap_or_else(|_| "tls.cert".to_string());
-                info!(
-                    "✅ LND payment detector initialised ({})",
-                    address
-                );
+                let cert_file =
+                    std::env::var("CERT_FILE_PATH").unwrap_or_else(|_| "tls.cert".to_string());
+                info!("✅ LND payment detector initialised ({})", address);
                 PaymentDetector::Lnd(LndDetector {
                     address,
                     macaroon_file,
@@ -117,7 +112,10 @@ pub fn init_payment_detector() {
                 ln_client_type
             );
             PaymentDetector::Unsupported {
-                reason: format!("{} cannot query remote wallet invoice state", ln_client_type),
+                reason: format!(
+                    "{} cannot query remote wallet invoice state",
+                    ln_client_type
+                ),
             }
         }
     };
@@ -127,7 +125,6 @@ pub fn init_payment_detector() {
     }
 }
 
-
 pub struct LndDetector {
     pub address: String,
     pub macaroon_file: String,
@@ -136,7 +133,6 @@ pub struct LndDetector {
 
 impl LndDetector {
     pub async fn lookup(&self, payment_hash: &[u8]) -> Result<Option<Vec<u8>>, String> {
-
         let parts: Vec<&str> = self.address.split(':').collect();
         if parts.len() != 2 {
             return Err(format!("Invalid LND_ADDRESS: {}", self.address));
@@ -146,10 +142,14 @@ impl LndDetector {
             .parse()
             .map_err(|_| "Invalid LND port".to_string())?;
 
-        let mut client =
-            tonic_openssl_lnd::connect(host, port, self.cert_file.clone(), self.macaroon_file.clone())
-                .await
-                .map_err(|e| format!("LND connection failed: {}", e))?;
+        let mut client = tonic_openssl_lnd::connect(
+            host,
+            port,
+            self.cert_file.clone(),
+            self.macaroon_file.clone(),
+        )
+        .await
+        .map_err(|e| format!("LND connection failed: {}", e))?;
 
         let request = lnrpc::PaymentHash {
             r_hash: payment_hash.to_vec(),
@@ -187,7 +187,6 @@ impl LndDetector {
     }
 }
 
-
 pub struct ClnDetector {
     pub rpc_path: String,
 }
@@ -223,7 +222,10 @@ impl ClnDetector {
         let invoice = match resp.invoices.into_iter().next() {
             Some(inv) => inv,
             None => {
-                warn!("⚠️  CLN: no invoice found for payment_hash {}", &payment_hash_hex[..16]);
+                warn!(
+                    "⚠️  CLN: no invoice found for payment_hash {}",
+                    &payment_hash_hex[..16]
+                );
                 return Ok(None);
             }
         };
@@ -238,12 +240,14 @@ impl ClnDetector {
                 None => Err("CLN invoice settled but preimage missing".into()),
             }
         } else {
-            debug!("⏳ CLN invoice not yet settled (status={:?})", invoice.status);
+            debug!(
+                "⏳ CLN invoice not yet settled (status={:?})",
+                invoice.status
+            );
             Ok(None)
         }
     }
 }
-
 
 pub struct EclairDetector {
     pub api_url: String,
@@ -265,12 +269,18 @@ impl EclairDetector {
             .map_err(|e| format!("Eclair HTTP error: {}", e))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            warn!("⚠️  Eclair: invoice not found for payment_hash {}", &payment_hash_hex[..16]);
+            warn!(
+                "⚠️  Eclair: invoice not found for payment_hash {}",
+                &payment_hash_hex[..16]
+            );
             return Ok(None);
         }
 
         if !resp.status().is_success() {
-            return Err(format!("Eclair /getreceivedinfo returned HTTP {}", resp.status()));
+            return Err(format!(
+                "Eclair /getreceivedinfo returned HTTP {}",
+                resp.status()
+            ));
         }
 
         let body: serde_json::Value = resp

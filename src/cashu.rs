@@ -4,6 +4,7 @@ use cdk;
 use cdk::mint_url::MintUrl;
 use hex;
 use l402_middleware::lnclient;
+use l402_middleware::lndrpc::lnrpc;
 use log::{debug, error, info, warn};
 use redis::Commands;
 use sha2::{Digest, Sha256};
@@ -12,7 +13,6 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
-use l402_middleware::lndrpc::lnrpc;
 use url::Url;
 
 // Thread-local storage to track processed tokens
@@ -192,7 +192,12 @@ fn wallet_mnemonic_file_path(db_url: &str) -> Option<String> {
         .trim_start_matches("sqlite://")
         .trim_start_matches("sqlite:");
     let parent = std::path::Path::new(raw).parent()?;
-    Some(parent.join("wallet.mnemonic").to_string_lossy().into_owned())
+    Some(
+        parent
+            .join("wallet.mnemonic")
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Persist the mnemonic to `path` with owner-only permissions where supported.
@@ -216,8 +221,7 @@ fn get_cached_seed() -> [u8; 64] {
         // Derivation lives in ngx_l402_core so it can be unit-tested (golden
         // vectors) without nginx. The mnemonic was validated at init, so this
         // cannot fail here.
-        ngx_l402_core::derive_wallet_seed(mnemonic)
-            .expect("wallet mnemonic was validated at init")
+        ngx_l402_core::derive_wallet_seed(mnemonic).expect("wallet mnemonic was validated at init")
     })
 }
 
@@ -509,22 +513,28 @@ pub async fn restore_wallets_state() {
         // block the nginx worker process or produce alarming ERROR logs.
         // Restoration is best-effort — missed proofs will be recovered
         // on the next redemption or sweep cycle.
-        let restore_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                match cdk::wallet::Wallet::new(mint_url, unit, db.clone(), seed, None) {
-                    Ok(wallet) => wallet.restore().await
-                        .map(|amount| { let v: u64 = amount.into(); v })
-                        .map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                }
+        let restore_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            match cdk::wallet::Wallet::new(mint_url, unit, db.clone(), seed, None) {
+                Ok(wallet) => wallet
+                    .restore()
+                    .await
+                    .map(|amount| {
+                        let v: u64 = amount.into();
+                        v
+                    })
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
             }
-        ).await;
+        })
+        .await;
 
         match restore_result {
             Ok(Ok(amount)) => info!("✅ Restored {} sats state from {}", amount, mint_url),
-            Ok(Err(e))     => warn!("⚠️ Skipping restore for {} (mint error): {}", mint_url, e),
-            Err(_)         => warn!("⚠️ Skipping restore for {} (unreachable, timed out after 5s)", mint_url),
+            Ok(Err(e)) => warn!("⚠️ Skipping restore for {} (mint error): {}", mint_url, e),
+            Err(_) => warn!(
+                "⚠️ Skipping restore for {} (unreachable, timed out after 5s)",
+                mint_url
+            ),
         }
     }
 }
@@ -576,7 +586,10 @@ pub async fn reconcile_pending_proofs() {
                 mint_url, reclaimable
             ),
             Ok(Ok(_)) => debug!("✅ No pending proofs to reconcile for {}", mint_url),
-            Ok(Err(e)) => warn!("⚠️ Pending-proof reconciliation failed for {}: {}", mint_url, e),
+            Ok(Err(e)) => warn!(
+                "⚠️ Pending-proof reconciliation failed for {}: {}",
+                mint_url, e
+            ),
             Err(_) => warn!(
                 "⚠️ Pending-proof reconciliation timed out for {} (mint unreachable)",
                 mint_url
@@ -927,7 +940,10 @@ pub async fn verify_cashu_token(
                         }
                     }
                     Err(e) => {
-                        warn!("⚠️ Failed to extract proofs from token for lnurl mapping: {}", e);
+                        warn!(
+                            "⚠️ Failed to extract proofs from token for lnurl mapping: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -949,7 +965,10 @@ pub async fn verify_cashu_token(
                     Ok(false)
                 }
                 Err(e) => {
-                    warn!("⚠️ Redis claim failed, admitting (fail-open, mint-backstopped): {}", e);
+                    warn!(
+                        "⚠️ Redis claim failed, admitting (fail-open, mint-backstopped): {}",
+                        e
+                    );
                     cache_processed_token(token);
                     Ok(true)
                 }
@@ -1157,7 +1176,10 @@ pub async fn verify_cashu_token_p2pk(
         };
         verify_proof_dleq_offline(proof, amount_key, require_dleq)?;
     }
-    info!("✅ All {} proofs passed NUT-12 DLEQ verification", proofs.len());
+    info!(
+        "✅ All {} proofs passed NUT-12 DLEQ verification",
+        proofs.len()
+    );
 
     // NUT-07: check proof state with the mint before accepting.
     // Without this call, a proof that has already been spent at the mint would
@@ -1240,7 +1262,10 @@ pub async fn verify_cashu_token_p2pk(
             // Fail closed — refuse the token until Redis recovers — matching the
             // preimage path's outage policy. The proofs are not stored, so a
             // legitimate retry after recovery still succeeds.
-            error!("❌ Redis unavailable for Cashu P2PK claim — rejecting to prevent replay: {}", e);
+            error!(
+                "❌ Redis unavailable for Cashu P2PK claim — rejecting to prevent replay: {}",
+                e
+            );
             return Err(format!(
                 "Redis unavailable; refusing Cashu token to prevent replay: {}",
                 e
@@ -1373,10 +1398,7 @@ pub async fn redeem_to_lightning() -> Result<bool, String> {
         let total_amount: u64 = match wallet_clone.total_balance().await {
             Ok(balance) => balance.into(),
             Err(e) => {
-                let msg = format!(
-                    "⚠️ Failed to get total balance for {}: {}",
-                    mint_url_str, e
-                );
+                let msg = format!("⚠️ Failed to get total balance for {}: {}", mint_url_str, e);
                 warn!("{}", msg);
                 cashu_redemption_logger::log_redemption(&msg);
                 continue;
@@ -1933,8 +1955,7 @@ mod tests {
     const VALID_PROOF_JSON: &str = r#"{"amount": 1,"id": "00882760bfa2eb41","secret": "daf4dd00a2b68a0858a80450f52c8a7d2ccf87d375e43e216e0c571f089f63e9","C": "024369d2d22a80ecf78f3937da9d5f30c1b9f74f0c32684d583cca0fa6a61cdcfc","dleq": {"e": "b31e58ac6527f34975ffab13e70a48b6d2b0d35abc4b03f0151f09ee1a9763d4","s": "8fbae004c59e754d71df67e392b6ae4e29293113ddc2ec86592a0431d16306d8","r": "a6d13fcd7a18442e6076f5e1e7c887ad5de40a019824bdfa9fe740d302e8d861"}}"#;
 
     // The mint public key `A` that signed the proof above.
-    const MINT_KEY_HEX: &str =
-        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const MINT_KEY_HEX: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
     fn mint_key() -> PublicKey {
         PublicKey::from_str(MINT_KEY_HEX).unwrap()

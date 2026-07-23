@@ -84,7 +84,7 @@ mod tests {
         assert!(parse_p2pk_secret_key("").is_err());
         assert!(parse_p2pk_secret_key("xyz").is_err());
         assert!(parse_p2pk_secret_key("01").is_err()); // too short
-        // Zero scalar is not a valid secp256k1 secret key.
+                                                       // Zero scalar is not a valid secp256k1 secret key.
         assert!(parse_p2pk_secret_key(
             "0000000000000000000000000000000000000000000000000000000000000000"
         )
