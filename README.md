@@ -20,15 +20,15 @@ For local contributor setup on macOS (Docker nginx recommended), see `docs/macos
 
 ## 📖 Documentation
 
-**Full documentation is available at: https://dhananjaypurohit.github.io/ngx_l402/**
+**Full documentation is available at: https://ngx-l402.org/docs/**
 
-- [Installation](https://dhananjaypurohit.github.io/ngx_l402/install-manual.html)
-- [Docker Setup](https://dhananjaypurohit.github.io/ngx_l402/install-docker.html)
-- [Configuration & Environment Variables](https://dhananjaypurohit.github.io/ngx_l402/config-env-vars.html)
-- [Cashu eCash Support](https://dhananjaypurohit.github.io/ngx_l402/cashu.html)
-- [Multi-Tenant](https://dhananjaypurohit.github.io/ngx_l402/config-multi-tenant.html)
-- [Dry-Run (Shadow) Mode](https://dhananjaypurohit.github.io/ngx_l402/dry-run.html)
-- [Building from Source](https://dhananjaypurohit.github.io/ngx_l402/building.html)
+- [Installation](https://ngx-l402.org/docs/install-manual.html)
+- [Docker Setup](https://ngx-l402.org/docs/install-docker.html)
+- [Configuration & Environment Variables](https://ngx-l402.org/docs/config-env-vars.html)
+- [Cashu eCash Support](https://ngx-l402.org/docs/cashu.html)
+- [Multi-Tenant](https://ngx-l402.org/docs/config-multi-tenant.html)
+- [Dry-Run (Shadow) Mode](https://ngx-l402.org/docs/dry-run.html)
+- [Building from Source](https://ngx-l402.org/docs/building.html)
 
 ---
 
