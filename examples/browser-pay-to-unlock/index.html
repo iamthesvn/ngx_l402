@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ngx-l402 · pay to unlock (WebLN demo)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg:#fbfaf7; --bg-2:#f4f2ed; --ink:#16170f; --ink-2:#3a3a30; --ink-3:#6b6b5c;
+    --rule:#e4e0d6; --rule-2:#d9d5c8; --accent:#2d5bff; --accent-ink:#1a3fd1;
+    --green:#4caf50; --warn:#c46a1b;
+    --code-bg:#11130b; --code-ink:#e6e4d6;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:'Inter',system-ui,sans-serif; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:680px; margin:0 auto; padding:48px 24px 80px; }
+  .mono { font-family:'JetBrains Mono',ui-monospace,monospace; }
+  h1 { font-size:30px; letter-spacing:-0.02em; margin:0 0 8px; }
+  .lede { color:var(--ink-2); margin:0 0 28px; max-width:54ch; }
+  a { color:var(--accent); } a:hover { color:var(--accent-ink); }
+  label { display:block; font-size:13px; color:var(--ink-3); margin:0 0 6px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+  .field { flex:1 1 200px; }
+  input {
+    width:100%; padding:10px 12px; border:1px solid var(--rule-2); border-radius:7px;
+    font:inherit; background:#fff; color:var(--ink);
+  }
+  input:focus { outline:2px solid var(--accent); outline-offset:1px; border-color:transparent; }
+  .btn {
+    display:inline-flex; align-items:center; gap:8px; padding:11px 16px;
+    border:0; border-radius:7px; font:inherit; font-weight:500; font-size:14.5px;
+    cursor:pointer; transition:background .12s,border-color .12s,opacity .12s;
+  }
+  .btn--primary { background:var(--accent); color:#fff; }
+  .btn--primary:hover { background:var(--accent-ink); }
+  .btn--secondary { background:#fff; color:var(--ink); border:1px solid var(--rule-2); }
+  .btn--secondary:hover { border-color:var(--ink-3); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .card {
+    border:1px solid var(--rule); border-radius:10px; background:#fff;
+    padding:20px; margin:18px 0;
+  }
+  .steps { list-style:none; padding:0; margin:24px 0 0; }
+  .steps li {
+    display:flex; gap:12px; align-items:flex-start; padding:10px 0;
+    border-top:1px solid var(--rule); color:var(--ink-3); font-size:14px;
+  }
+  .steps li.active { color:var(--ink); }
+  .steps li.done { color:var(--green); }
+  .dot {
+    flex:0 0 auto; width:20px; height:20px; border-radius:50%;
+    border:1.5px solid currentColor; display:grid; place-items:center;
+    font-size:11px; font-weight:600; margin-top:1px;
+  }
+  pre {
+    background:var(--code-bg); color:var(--code-ink); border-radius:8px;
+    padding:14px 16px; overflow-x:auto; font-family:'JetBrains Mono',monospace;
+    font-size:12.5px; line-height:1.6; margin:12px 0 0; white-space:pre-wrap;
+    word-break:break-all;
+  }
+  .invoice { font-family:'JetBrains Mono',monospace; font-size:12px; word-break:break-all; }
+  .muted { color:var(--ink-3); font-size:13px; }
+  .ok { color:var(--green); } .warn { color:var(--warn); }
+  .hidden { display:none; }
+  .unlocked {
+    border:1px solid var(--green); background:rgba(76,175,80,.06);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⚡ Pay to unlock</h1>
+  <p class="lede">
+    A browser client for an <a href="https://ngx-l402.org" target="_blank" rel="noopener">ngx-l402</a>
+    paywall. Request a protected route, pay the <span class="mono">402</span> invoice
+    with a WebLN wallet (or any wallet), and the content unlocks live — the whole
+    L402 flow in the browser.
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <div class="field">
+        <label for="gateway">Gateway URL</label>
+        <input id="gateway" class="mono" value="http://localhost:8000" />
+      </div>
+      <div class="field">
+        <label for="path">Protected path</label>
+        <input id="path" class="mono" value="/protected" />
+      </div>
+    </div>
+    <button id="go" class="btn btn--primary">Request &amp; pay →</button>
+    <span id="webln-note" class="muted" style="margin-left:12px;"></span>
+  </div>
+
+  <ol class="steps" id="steps">
+    <li data-step="1"><span class="dot">1</span><span>Request the route — expect <span class="mono">402 Payment Required</span></span></li>
+    <li data-step="2"><span class="dot">2</span><span>Pay the Lightning invoice</span></li>
+    <li data-step="3"><span class="dot">3</span><span>Retry with the preimage — unlock</span></li>
+  </ol>
+
+  <div id="invoice-card" class="card hidden">
+    <label>Invoice</label>
+    <div class="invoice" id="invoice-text"></div>
+    <div class="row" style="margin-top:14px;margin-bottom:0;">
+      <button id="pay-webln" class="btn btn--primary">Pay with WebLN</button>
+      <a id="pay-link" class="btn btn--secondary" href="#">Open in wallet</a>
+      <button id="copy-inv" class="btn btn--secondary">Copy invoice</button>
+    </div>
+    <div style="margin-top:14px;">
+      <label for="preimage">…or paste the preimage after paying manually</label>
+      <div class="row" style="margin-bottom:0;">
+        <input id="preimage" class="mono" placeholder="64 hex characters" />
+        <button id="submit-preimage" class="btn btn--secondary">Unlock</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="result-card" class="card hidden">
+    <div id="result-label"></div>
+    <pre id="result-body"></pre>
+  </div>
+
+  <p class="muted" style="margin-top:28px;">
+    Cross-origin? The gateway must send <span class="mono">Access-Control-Allow-Origin</span>
+    and <span class="mono">Access-Control-Expose-Headers: WWW-Authenticate</span>, or
+    serve this page from the gateway's own origin. See the README.
+  </p>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { macaroon: null, invoice: null };
+
+function setStep(n, status) {
+  const li = document.querySelector(`#steps li[data-step="${n}"]`);
+  if (!li) return;
+  li.classList.remove('active', 'done');
+  if (status) li.classList.add(status);
+  const dot = li.querySelector('.dot');
+  dot.textContent = status === 'done' ? '✓' : n;
+}
+
+function showResult(label, body, unlocked) {
+  $('result-card').classList.remove('hidden');
+  $('result-card').classList.toggle('unlocked', !!unlocked);
+  $('result-label').innerHTML = label;
+  $('result-body').textContent = body;
+}
+
+function parseChallenge(header) {
+  const fields = {};
+  for (const m of header.matchAll(/(\w+)\s*=\s*"([^"]*)"/g)) fields[m[1]] = m[2];
+  const macaroon = fields.macaroon || fields.token;
+  const invoice = fields.invoice;
+  if (!macaroon || !invoice) throw new Error('could not read macaroon/invoice from WWW-Authenticate');
+  return { macaroon, invoice };
+}
+
+function gateway() { return $('gateway').value.replace(/\/$/, ''); }
+function target() { return gateway() + $('path').value; }
+
+async function request() {
+  setStep(1, 'active'); setStep(2, ''); setStep(3, '');
+  $('invoice-card').classList.add('hidden');
+  $('result-card').classList.add('hidden');
+  let resp;
+  try {
+    resp = await fetch(target());
+  } catch (e) {
+    setStep(1, ''); showResult('<span class="warn">Network/CORS error</span>',
+      String(e) + '\n\nIf the gateway is on another origin, it must allow CORS and expose WWW-Authenticate.');
+    return;
+  }
+  if (resp.status === 200) {
+    setStep(1, 'done');
+    showResult('<span class="ok">Already 200 OK</span> — this route is not paywalled.', await resp.text());
+    return;
+  }
+  if (resp.status !== 402) {
+    setStep(1, ''); showResult('<span class="warn">Unexpected ' + resp.status + '</span>', await resp.text());
+    return;
+  }
+  const header = resp.headers.get('WWW-Authenticate');
+  if (!header) {
+    setStep(1, ''); showResult('<span class="warn">Got 402 but cannot read WWW-Authenticate</span>',
+      'The header is hidden by CORS. Serve this page from the gateway origin, or add\nAccess-Control-Expose-Headers: WWW-Authenticate on the gateway.');
+    return;
+  }
+  try {
+    const { macaroon, invoice } = parseChallenge(header);
+    state.macaroon = macaroon; state.invoice = invoice;
+    setStep(1, 'done'); setStep(2, 'active');
+    $('invoice-text').textContent = invoice;
+    $('pay-link').href = 'lightning:' + invoice;
+    $('invoice-card').classList.remove('hidden');
+  } catch (e) {
+    setStep(1, ''); showResult('<span class="warn">Parse error</span>', String(e) + '\n\n' + header);
+  }
+}
+
+async function retry(preimage) {
+  setStep(2, 'done'); setStep(3, 'active');
+  let resp;
+  try {
+    resp = await fetch(target(), { headers: { Authorization: `L402 ${state.macaroon}:${preimage}` } });
+  } catch (e) {
+    setStep(3, ''); showResult('<span class="warn">Network/CORS error on retry</span>', String(e));
+    return;
+  }
+  const body = await resp.text();
+  if (resp.status === 200) {
+    setStep(3, 'done');
+    showResult('<span class="ok">🔓 200 OK — unlocked</span>', body, true);
+  } else {
+    setStep(3, ''); showResult('<span class="warn">Retry returned ' + resp.status + '</span>', body);
+  }
+}
+
+async function payWithWebLN() {
+  if (!window.webln) {
+    $('webln-note').innerHTML = '<span class="warn">No WebLN wallet detected (try the Alby extension), or pay manually below.</span>';
+    return;
+  }
+  try {
+    await window.webln.enable();
+    const res = await window.webln.sendPayment(state.invoice);
+    if (!res || !res.preimage) throw new Error('wallet returned no preimage');
+    await retry(res.preimage);
+  } catch (e) {
+    $('webln-note').innerHTML = '<span class="warn">WebLN: ' + String(e.message || e) + '</span>';
+  }
+}
+
+$('go').addEventListener('click', request);
+$('pay-webln').addEventListener('click', payWithWebLN);
+$('submit-preimage').addEventListener('click', () => {
+  const p = $('preimage').value.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(p)) { $('webln-note').innerHTML = '<span class="warn">Preimage must be 64 hex characters.</span>'; return; }
+  retry(p);
+});
+$('copy-inv').addEventListener('click', () => navigator.clipboard.writeText(state.invoice || ''));
+
+$('webln-note').textContent = window.webln ? 'WebLN wallet detected.' : '';
+</script>
+</body>
+</html>

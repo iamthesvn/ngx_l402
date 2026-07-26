@@ -1,0 +1,78 @@
+name: blossom-l402
+
+# Paywalled Blossom blob server (nginx-only):
+#   internet → nginx-l402 (TLS + paywall) → blossom
+# `docker compose up -d` is fully automatic: certbot obtains the Let's Encrypt
+# cert (standalone) and auto-renews it; nginx waits for the cert, then serves 443.
+
+services:
+  redis:
+    image: redis:7.2
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  blossom:
+    # Blob store (BUD-01/02/03). If this tag is unavailable, clone
+    # github.com/hzrd149/blossom-server here and use `build: ./blossom-server`.
+    image: ghcr.io/hzrd149/blossom-server:master
+    restart: unless-stopped
+    volumes:
+      - ./blossom-config.yml:/app/config.yml:ro
+      - blossom-data:/app/data
+
+  certbot:
+    # Owns port 80: issues the cert once (standalone) and then
+    # renews it twice a day. Healthy once the cert exists — nginx waits on that.
+    # Needs DNS already pointing at this host and port 80 reachable.
+    image: certbot/certbot
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    environment:
+      - DOMAIN=${DOMAIN}
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+    entrypoint:
+      - sh
+      - -c
+      - "[ -f /etc/letsencrypt/live/$${DOMAIN}/fullchain.pem ] || certbot certonly --standalone --non-interactive --agree-tos --no-eff-email -m $${CERTBOT_EMAIL} -d $${DOMAIN}; trap exit TERM; while :; do certbot renew --standalone; sleep 12h & wait $${!}; done"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /etc/letsencrypt/live/$${DOMAIN}/fullchain.pem"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+
+  nginx-l402:
+    image: ghcr.io/ngx-l402/ngx-l402:latest
+    restart: unless-stopped
+    environment:
+      - LN_CLIENT_TYPE=LNURL
+      - LNURL_ADDRESS=${LNURL_ADDRESS}
+      - ROOT_KEY=${ROOT_KEY}
+      - REDIS_URL=redis://redis:6379
+      - DOMAIN=${DOMAIN}
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx.conf.template:/etc/nginx/nginx.conf.template:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+    depends_on:
+      redis:
+        condition: service_started
+      blossom:
+        condition: service_started
+      certbot:
+        condition: service_healthy
+    # Render ${DOMAIN} into the config, then run nginx and reload every 6h so
+    # renewed certs are picked up.
+    command:
+      - sh
+      - -c
+      - "envsubst '$$DOMAIN' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && { while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'; }"
+
+volumes:
+  redis-data:
+  blossom-data:

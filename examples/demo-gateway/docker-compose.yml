@@ -1,0 +1,30 @@
+services:
+  gateway:
+    image: ghcr.io/dhananjaypurohit/ngx_l402:latest
+    container_name: l402-demo-gateway
+    depends_on:
+      - redis
+    ports:
+      - "8000:8000"
+    environment:
+      # Simplest backend: a Lightning address you control receives the sats.
+      - LN_CLIENT_TYPE=LNURL
+      - LNURL_ADDRESS=${LNURL_ADDRESS}
+      - ROOT_KEY=${ROOT_KEY}
+      - REDIS_URL=redis://redis:6379
+      - L402_SERVICE_NAME=ngx-l402 demo
+      - L402_SERVICE_DESCRIPTION=Live demo gateway for ngx-l402.org — 1 sat per request.
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2
+    container_name: l402-demo-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis:/data
+    restart: unless-stopped
+
+volumes:
+  redis:

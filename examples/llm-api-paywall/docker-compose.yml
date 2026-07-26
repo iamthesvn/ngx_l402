@@ -1,0 +1,39 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: l402-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  redis:
+    image: redis:7.2
+    container_name: l402-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis:/data
+
+  gateway:
+    image: ghcr.io/dhananjaypurohit/ngx_l402:latest
+    container_name: l402-gateway
+    depends_on:
+      - ollama
+      - redis
+    ports:
+      - "8000:8000"
+    environment:
+      # Simplest backend: invoices are generated from your Lightning address.
+      - LN_CLIENT_TYPE=LNURL
+      - LNURL_ADDRESS=${LNURL_ADDRESS}
+      - ROOT_KEY=${ROOT_KEY}
+      - REDIS_URL=redis://redis:6379
+      # Capability-manifest metadata (shown at /.well-known/l402-services).
+      - L402_SERVICE_NAME=Paid LLM
+      - L402_SERVICE_DESCRIPTION=Chat completions, paid per call over Lightning.
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  ollama:
+  redis:
