@@ -16,7 +16,6 @@
 use log::{debug, error, info, warn};
 use reqwest::Client as HttpClient;
 use std::sync::OnceLock;
-use tonic;
 use tonic_openssl_lnd::lnrpc;
 
 /// The configured detector (one instance for the lifetime of the worker).
@@ -106,7 +105,7 @@ pub fn init_payment_detector() {
                 reason: "NWC lookup_invoice is not universally supported".into(),
             }
         }
-        "LNURL" | _ => {
+        _ => {
             warn!(
                 "⚠️  {} backend does not support server-side invoice lookup; disabling auto-detect",
                 ln_client_type
