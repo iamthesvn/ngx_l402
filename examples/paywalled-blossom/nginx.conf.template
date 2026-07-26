@@ -1,0 +1,128 @@
+user  nginx;
+worker_processes  auto;
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+# ngx_l402 module (baked into the image by the project Dockerfile)
+load_module /etc/nginx/modules/libngx_l402_lib.so;
+
+events { worker_connections 1024; }
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile      on;
+    keepalive_timeout 65;
+
+    # Blobs can be large; don't cap proxied bodies.
+    client_max_body_size 0;
+
+    # Docker's embedded DNS resolves the blossom upstream lazily.
+    resolver 127.0.0.11 ipv6=off valid=30s;
+
+    # Caps how much egress one paid realm token can drain (see the blob location).
+    limit_conn_zone $binary_remote_addr zone=blobconn:10m;
+
+    # TLS + L402 paywall + proxy to Blossom. ${DOMAIN} is filled in at startup
+    # (envsubst); certs come from the certbot service.
+    server {
+        listen 443 ssl;
+        server_name ${DOMAIN};
+
+        ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_session_cache   shared:SSL:10m;
+        ssl_session_timeout 1d;
+
+        set $blossom_backend blossom:3000;
+
+        # --- Paywalled: blob download by digest (GET /<sha256>[.ext]) ---
+        # `l402_realm` binds the macaroon to a named protection space instead of
+        # one exact path, so a SINGLE payment covers every blob served here. A
+        # client that needs N related blobs pays once instead of N times.
+        #
+        # The three directives work together:
+        #   realm             → one token is valid for any blob in this location
+        #   macaroon_timeout  → bounds that access (without it, one payment = forever)
+        #   indefinite_access → REQUIRED here: it skips the single-use preimage
+        #                       replay check. Without it the preimage is claimed on
+        #                       the first request and every later one is rejected as
+        #                       a replay, which would defeat the realm entirely.
+        location ~ "^/[0-9a-f]{64}(\.[a-z0-9]+)?$" {
+            l402 on;
+            l402_amount_msat_default 10000;          # 10 sats per window (see below)
+            l402_realm               "blossom-read";
+            l402_macaroon_timeout    600;            # one payment → 10 min of pulls
+            l402_indefinite_access   on;             # let that token be reused
+
+            # A realm token buys a WINDOW of egress, not one blob — so bound the
+            # throughput rather than the clock. Shortening the window instead is a
+            # trap: a large multi-blob fetch would expire mid-transfer and start
+            # 402-ing on whatever is left.
+            #
+            # limit_rate is per connection and clients commonly fetch several
+            # blobs concurrently, so limit_conn is what actually caps a client:
+            # 4 × 5 MB/s ≈ 20 MB/s. Fast enough for a real fetch, slow enough that
+            # draining the store at 10 sats isn't worth it. Price the window for
+            # what it can move.
+            limit_conn blobconn 4;
+            limit_rate 5m;
+
+            proxy_pass http://$blossom_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # --- Paywalled: uploads (pay to store a blob; it auto-expires after the
+        # blossom 90-day retention window). Anyone can pay and upload — there is
+        # no pubkey whitelist, the payment IS the gate.
+        #
+        # Deliberately NOT a realm: each stored blob consumes disk for 90 days, so
+        # payment is per upload. A write realm would mean "pay once, upload all you
+        # like until the token expires" — fine for a trusted batch publisher, wrong
+        # for an open store. To opt into that, add:
+        #     l402_realm "blossom-write"; l402_macaroon_timeout <short>;
+        #     l402_indefinite_access on;
+        # and price it for the window rather than the blob.
+        #
+        # Note a read token can't be spent here regardless: realms don't cross, and
+        # the macaroon also binds the HTTP method (GET token ≠ PUT token).
+        #
+        # CAVEAT: a vanilla Blossom client PUTs the blob, gets 402, then re-sends it
+        # with payment — so a large blob crosses the wire twice, and the client must
+        # speak L402 (not plain Blossom).
+        location = /upload {
+            l402 on;
+            l402_amount_msat_default 100000;   # price to store one blob — tune this
+            l402_macaroon_timeout    0;        # single-use: one payment = one upload
+
+            proxy_pass http://$blossom_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /mirror also stores a blob (it fetches one from another server), so it
+        # gets the same price — otherwise it's a free way around the upload gate.
+        location = /mirror {
+            l402 on;
+            l402_amount_msat_default 100000;
+            l402_macaroon_timeout    0;
+
+            proxy_pass http://$blossom_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # --- Free: HEAD, list, dashboard, and everything else. ---
+        location / {
+            proxy_pass http://$blossom_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}

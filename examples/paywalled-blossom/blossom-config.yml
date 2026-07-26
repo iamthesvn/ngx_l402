@@ -1,0 +1,24 @@
+# Minimal blossom-server config. IMPORTANT: base this on the up-to-date example
+# config.yml in https://github.com/hzrd149/blossom-server (the schema evolves and
+# may require keys not shown here — database, dashboard, etc.). The settings below
+# are the ones specific to running it as a paywalled, publisher-restricted store.
+
+port: 3000
+publicDomain: https://blossom.ngx-l402.org   # your real domain
+
+# Local disk storage for blobs (persisted via the blossom-data volume).
+storage:
+  backend: local
+  local:
+    dir: ./data/blobs
+  # Anyone may store a blob — the Lightning payment at the nginx layer is the
+  # gate, not a pubkey whitelist. Every blob auto-expires 90 days after upload,
+  # so the server is a rolling, self-cleaning "latest copy" store: publishers
+  # re-upload (and re-pay) to keep their copy fresh; stale blobs delete themselves.
+  rules:
+    - type: "*"
+      expiration: 90 days     # NOTE: confirm the duration format against the
+                              # upstream blossom-server schema (may be seconds).
+
+upload:
+  requireAuth: false         # no BUD-02 auth event required — payment replaces it
