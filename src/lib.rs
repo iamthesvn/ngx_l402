@@ -1,8 +1,8 @@
+use l402_middleware::caveats::RequestBinding;
 use l402_middleware::lndrpc::lnrpc;
 use l402_middleware::middleware::L402Middleware;
 use l402_middleware::{bolt12, cln, eclair, l402, lnclient, lnd, lnurl, macaroon_util, nwc, utils};
 use log::{debug, error, info, warn};
-use macaroon::Verifier;
 use ngx::core::Buffer;
 use ngx::ffi::{
     nginx_version, ngx_array_push, ngx_chain_t, ngx_command_t, ngx_conf_t, ngx_cycle_s,
@@ -39,7 +39,6 @@ mod cashu;
 mod cashu_redemption_logger;
 mod manifest;
 mod metrics;
-mod payment_detector;
 mod payment_page;
 
 static MODULE: OnceLock<L402Module> = OnceLock::new();
@@ -114,6 +113,142 @@ static PERF_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 /// makes HTTPS requests via reqwest which uses spawn_blocking for TLS/DNS operations.
 /// A single-threaded runtime has no blocking thread pool, causing those calls to panic.
 static HANDLER_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+/// This module's load address, resolved at install time.
+static MODULE_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Report where a worker died when it takes a fatal signal.
+///
+/// nginx logs only "worker process N exited on signal 11", which does not say
+/// where. This prints the faulting instruction as a module offset, so
+/// `addr2line -f -C -e libngx_l402_lib.so <offset>` names the function.
+///
+/// The handler allocates nothing — a fault inside the allocator leaves its lock
+/// held, so allocating here would hang the worker rather than let it die. Hence
+/// the hand-rolled number formatting and the base resolved up front.
+///
+/// Dispositions survive `fork()`, so installing in the master covers every worker.
+#[cfg(unix)]
+fn install_crash_handler() {
+    use std::sync::atomic::Ordering;
+
+    /// Write `value` as hex into `buf` at `pos`, advancing it.
+    fn put_hex(buf: &mut [u8; 160], pos: &mut usize, value: usize) {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut started = false;
+        for shift in (0..16).rev() {
+            let nibble = (value >> (shift * 4)) & 0xf;
+            if nibble != 0 || started || shift == 0 {
+                started = true;
+                if *pos < buf.len() {
+                    buf[*pos] = DIGITS[nibble];
+                    *pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Decimal, so the signal number matches what nginx reports.
+    fn put_dec(buf: &mut [u8; 160], pos: &mut usize, mut value: usize) {
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        loop {
+            digits[n] = b'0' + (value % 10) as u8;
+            n += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            if *pos < buf.len() {
+                buf[*pos] = digits[n];
+                *pos += 1;
+            }
+        }
+    }
+
+    fn put_str(buf: &mut [u8; 160], pos: &mut usize, s: &str) {
+        for &b in s.as_bytes() {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    }
+
+    extern "C" fn on_fatal_signal(
+        sig: libc::c_int,
+        info: *mut libc::siginfo_t,
+        ctx: *mut std::ffi::c_void,
+    ) {
+        let fault_addr = if info.is_null() {
+            0usize
+        } else {
+            (unsafe { (*info).si_addr() }) as usize
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let pc = if ctx.is_null() {
+            0usize
+        } else {
+            unsafe {
+                let uc = ctx as *const libc::ucontext_t;
+                (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize
+            }
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pc = {
+            let _ = ctx;
+            0usize
+        };
+
+        let offset = pc.saturating_sub(MODULE_BASE.load(Ordering::Relaxed));
+
+        let mut buf = [0u8; 160];
+        let mut pos = 0usize;
+        put_str(&mut buf, &mut pos, "ngx_l402: worker died on signal ");
+        put_dec(&mut buf, &mut pos, sig as usize);
+        put_str(&mut buf, &mut pos, " at fault addr 0x");
+        put_hex(&mut buf, &mut pos, fault_addr);
+        put_str(&mut buf, &mut pos, ", module offset 0x");
+        put_hex(&mut buf, &mut pos, offset);
+        put_str(
+            &mut buf,
+            &mut pos,
+            " (addr2line -f -C -e libngx_l402_lib.so <offset>)\n",
+        );
+        unsafe { libc::write(2, buf.as_ptr() as *const std::ffi::c_void, pos) };
+
+        // SA_RESETHAND already restored the default disposition; re-raise so the
+        // exit status and any core dump are unchanged.
+        unsafe { libc::raise(sig) };
+    }
+
+    unsafe {
+        // dladdr on our own code gives this module's load base.
+        let mut dl_info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(
+            install_crash_handler as *const std::ffi::c_void,
+            &mut dl_info,
+        ) != 0
+        {
+            MODULE_BASE.store(dl_info.dli_fbase as usize, Ordering::Relaxed);
+        }
+
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_fatal_signal as *const () as libc::sighandler_t;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGABRT] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn install_crash_handler() {}
 
 fn get_handler_runtime() -> &'static Runtime {
     HANDLER_RUNTIME.get_or_init(|| {
@@ -782,6 +917,34 @@ impl L402Module {
         Self { middleware }
     }
 
+    /// Auto-detect settlement: ask the worker's LN client whether the invoice
+    /// for `payment_hash` is settled and, if so, return its preimage. Uses the
+    /// same per-worker client (and runtime) as invoice generation, so there is
+    /// no cross-runtime tonic channel. LNURL and LND over the LNC mailbox can't
+    /// answer and return an error.
+    pub async fn lookup_invoice(&self, payment_hash: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
+        let ln_client = match WORKER_LN_CLIENT
+            .get_or_try_init(|| async {
+                let config = LN_CLIENT_CONFIG.get().ok_or_else(
+                    || -> Box<dyn std::error::Error + Send + Sync> {
+                        "LN client config not available in worker".into()
+                    },
+                )?;
+                lnclient::LNClientConn::init(config).await
+            })
+            .await
+        {
+            Ok(c) => Arc::clone(c),
+            Err(e) => return Err(format!("worker LN client init failed: {}", e)),
+        };
+
+        let guard = ln_client.lock().await;
+        guard
+            .lookup_invoice(payment_hash)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn get_l402_header(
         &self,
         mut caveats: Vec<String>,
@@ -869,10 +1032,7 @@ impl L402Module {
             self.middleware.root_key.clone(),
         ) {
             Ok(macaroon_string) => {
-                let header_value = format!(
-                    "L402 macaroon=\"{}\", invoice=\"{}\"",
-                    macaroon_string, invoice
-                );
+                let header_value = l402::format_challenge(&macaroon_string, &invoice);
                 debug!("🍪 Generated macaroon header: {}", header_value);
                 Some(header_value)
             }
@@ -1104,6 +1264,11 @@ pub struct ModuleConfig {
     enable: bool,
     amount_msat: i64,
     macaroon_timeout: i64,
+    // Opt-in location-scoped ("realm") caveat. When set via `l402_realm "name"`,
+    // the minted macaroon binds to `Realm = name` + the HTTP method instead of
+    // the exact request path, so one payment authorizes every path this location
+    // serves (pair with l402_macaroon_timeout). `None` = default exact-path binding.
+    realm: Option<String>,
     lnurl_addr: Option<String>,
     // (max_requests, window_secs): e.g. (5, 60) means 5 invoices per minute per IP per route.
     // None means rate limiting is disabled for this location.
@@ -1123,7 +1288,7 @@ pub struct ModuleConfig {
     manifest_hidden: bool,
 }
 
-pub static mut NGX_HTTP_L402_COMMANDS: [ngx_command_t; 12] = [
+pub static mut NGX_HTTP_L402_COMMANDS: [ngx_command_t; 13] = [
     ngx_command_t {
         name: ngx_string!("l402"),
         type_: (NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
@@ -1213,6 +1378,14 @@ pub static mut NGX_HTTP_L402_COMMANDS: [ngx_command_t; 12] = [
         offset: 0,
         post: std::ptr::null_mut(),
     },
+    ngx_command_t {
+        name: ngx_string!("l402_realm"),
+        type_: (NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_l402_realm_set),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
     ngx_command_t::empty(),
 ];
 
@@ -1280,6 +1453,9 @@ impl Merge for ModuleConfig {
         if self.lnurl_addr.is_none() && prev.lnurl_addr.is_some() {
             self.lnurl_addr = prev.lnurl_addr.clone();
         }
+        if self.realm.is_none() && prev.realm.is_some() {
+            self.realm = prev.realm.clone();
+        }
         if self.invoice_rate_limit.is_none() {
             self.invoice_rate_limit = prev.invoice_rate_limit;
         }
@@ -1296,6 +1472,18 @@ impl Merge for ModuleConfig {
         }
         if prev.indefinite_access {
             self.indefinite_access = true;
+        }
+        // A realm token carries one preimage to every path in the realm. The
+        // first request claims it and the replay check rejects the rest, so
+        // without indefinite access the operator has sold exactly one request.
+        // env_logger is not up during config parse — stderr is what nginx shows.
+        if self.enable && self.realm.is_some() && !self.indefinite_access {
+            eprintln!(
+                "ngx_l402: l402_realm requires l402_indefinite_access on. Without it the \
+                 realm token is accepted once and every later request in the realm is \
+                 rejected as a replay."
+            );
+            return Err(MergeConfigError::NoValue);
         }
         Ok(())
     }
@@ -1324,6 +1512,24 @@ fn method_caveat_value(method: u32) -> &'static str {
         m if m == NGX_HTTP_LOCK => "LOCK",
         m if m == NGX_HTTP_UNLOCK => "UNLOCK",
         _ => "UNKNOWN",
+    }
+}
+
+/// Build the [`RequestBinding`] for a request from nginx config. Realm mode
+/// (opt-in via `l402_realm`) binds the token to a named protection space + HTTP
+/// method; otherwise the exact request path + method (the default).
+///
+/// The caveat *construction and enforcement* — including the auth-bypass guard —
+/// live in `l402_middleware` (`caveats::RequestBinding`), shared with every L402
+/// consumer. This adapter only picks the scope from nginx-specific config.
+fn request_binding(
+    realm: Option<&str>,
+    request_path: &str,
+    request_method: &str,
+) -> RequestBinding {
+    match realm {
+        Some(name) => RequestBinding::realm(name, request_method),
+        None => RequestBinding::path(request_path, request_method),
     }
 }
 
@@ -1427,6 +1633,7 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         auto_detect_payment,
         dry_run,
         indefinite_access,
+        realm,
     ) = unsafe {
         // NOTE: `authorization` can be null — not every request carries the header.
         let auth_header = if !r.headers_in.authorization.is_null() {
@@ -1478,6 +1685,7 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         let auto_detect_payment = conf.auto_detect_payment;
         let dry_run = conf.dry_run.unwrap_or(false);
         let indefinite_access = conf.indefinite_access;
+        let realm = conf.realm.clone();
 
         (
             auth_header,
@@ -1490,6 +1698,7 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
             auto_detect_payment,
             dry_run,
             indefinite_access,
+            realm,
         )
     };
 
@@ -1498,12 +1707,13 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
     // NOTE: no path normalization — stripping .html / trailing-slash suffixes
     // would widen the macaroon scope to the parent directory, allowing a token
     // issued for /docs/page.html to be reused against /docs/secret.
+    // In realm mode the binding is `Realm = <name>` (one payment covers the whole
+    // location); otherwise it's the exact path. Method is bound either way.
     let request_path = uri.clone();
     let request_method = method_caveat_value(method);
-    let caveats = vec![
-        format!("RequestPath = {}", request_path),
-        format!("RequestMethod = {}", request_method),
-    ];
+    // One binding drives mint, verify, and the dry-run log — so they can't drift.
+    let binding = request_binding(realm.as_deref(), &request_path, request_method);
+    let caveats = binding.to_caveats();
 
     let module = match MODULE.get() {
         Some(m) => m,
@@ -1552,7 +1762,7 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         uri,
         method,
         final_amount,
-        caveats.clone(),
+        &binding,
         final_lnurl_addr.clone(),
         auto_detect_payment,
         indefinite_access,
@@ -1684,30 +1894,39 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         // Always send L402 header as well (for Lightning payments)
         // Pass lnurl_addr for per-location LNURL-based invoice generation
         let invoice_start = Instant::now();
-        // Caveats were consumed by the access handler above; rebuild on the 402
-        // path only — saves a Vec<String> clone on the auth-pass hot path.
-        let challenge_caveats = vec![
-            format!("RequestPath = {}", request_path),
-            format!("RequestMethod = {}", request_method),
-        ];
+        // Caveats for the 402 challenge come from the same binding, so the
+        // minted token matches what verification will expect (realm-aware).
+        let challenge_caveats = binding.to_caveats();
         // Catch any panic from the LNURL library (bare .unwrap() calls in
         // l402_middleware's lnurl.rs can panic on network errors). Without this
         // guard a panic would unwind through nginx's C stack — undefined
         // behaviour in a cdylib that crashes the worker process (curl exit 52).
+        // Backends bound connecting, not the call, so an unanswered invoice
+        // request would hold this worker until the client gave up.
+        const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(10);
         let header_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async {
-                module
-                    .get_l402_header(
+                tokio::time::timeout(
+                    CHALLENGE_TIMEOUT,
+                    module.get_l402_header(
                         challenge_caveats,
                         final_amount,
                         macaroon_timeout,
                         final_lnurl_addr.clone(),
-                    )
-                    .await
+                    ),
+                )
+                .await
             })
         }))
         .unwrap_or_else(|_| {
             error!("❌ Panic in get_l402_header (LNURL resolution failure); returning 500");
+            Ok(None)
+        })
+        .unwrap_or_else(|_| {
+            error!(
+                "❌ Invoice generation timed out after {}s",
+                CHALLENGE_TIMEOUT.as_secs()
+            );
             None
         });
 
@@ -1790,7 +2009,7 @@ pub fn l402_access_handler(
     uri: String,
     method: u32,
     amount_msat: i64,
-    caveats: Vec<String>,
+    binding: &RequestBinding,
     lnurl_addr: Option<String>,
     auto_detect_payment: bool,
     indefinite_access: bool,
@@ -1822,24 +2041,32 @@ pub fn l402_access_handler(
 
             let rt = get_handler_runtime();
 
-            let verify_result = rt.block_on(async {
-                module
-                    .verify_cashu_token(&token, amount_msat, lnurl_addr.clone())
-                    .await
-            });
+            // A panic must not unwind across the FFI boundary — undefined
+            // behaviour in a cdylib. Same guard the LNURL invoice path uses.
+            let verify_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(async {
+                    module
+                        .verify_cashu_token(&token, amount_msat, lnurl_addr.clone())
+                        .await
+                })
+            }));
 
             match verify_result {
-                Ok(true) => {
+                Ok(Ok(true)) => {
                     LAST_PAYMENT_METHOD.with(|m| m.set(Some(PaymentMethod::Cashu)));
                     return NGX_DECLINED as isize;
                 }
-                Ok(false) => {
+                Ok(Ok(false)) => {
                     info!("⚠️ Cashu token verification failed");
                     return 401;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!("❌ Error verifying Cashu token: {:?}", e);
                     return 401;
+                }
+                Err(_) => {
+                    error!("❌ Panic while verifying Cashu token; returning 500");
+                    return 500;
                 }
             }
         } else {
@@ -1872,67 +2099,46 @@ pub fn l402_access_handler(
                 };
 
                 // 3. Resolve preimage: Redis cache → node lookup
-                let preimage_bytes: Vec<u8> = if let Some(cached) =
-                    get_cached_settled_preimage(&payment_hash)
-                {
-                    debug!("💾 Using cached settled preimage");
-                    cached
-                } else {
-                    // Use a lazily initialized static runtime
-                    static AUTODETECT_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-                    let rt = AUTODETECT_RUNTIME.get_or_init(|| {
-                        match tokio::runtime::Builder::new_multi_thread()
-                            .enable_all()
-                            .build()
-                        {
-                            Ok(rt) => rt,
-                            Err(e) => {
-                                eprintln!("FATAL: failed to create autodetect runtime: {}", e);
-                                std::process::abort();
+                let preimage_bytes: Vec<u8> =
+                    if let Some(cached) = get_cached_settled_preimage(&payment_hash) {
+                        debug!("💾 Using cached settled preimage");
+                        cached
+                    } else {
+                        // Reuse the per-worker LN client + handler runtime (same as
+                        // invoice generation) — no separate detector or runtime.
+                        let rt = get_handler_runtime();
+                        const AUTODETECT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+                        match rt.block_on(async {
+                            tokio::time::timeout(
+                                AUTODETECT_LOOKUP_TIMEOUT,
+                                module.lookup_invoice(payment_hash.to_vec()),
+                            )
+                            .await
+                        }) {
+                            Ok(Ok(Some(p))) => {
+                                // Cache for future requests
+                                if let Err(e) = cache_settled_preimage(&payment_hash, &p) {
+                                    warn!("⚠️ Failed to cache settled preimage: {}", e);
+                                }
+                                p
+                            }
+                            Ok(Ok(None)) => {
+                                info!("⏳ Invoice not yet settled — returning 402");
+                                return 402;
+                            }
+                            Ok(Err(e)) => {
+                                error!("❌ Node invoice lookup failed: {}", e);
+                                return 500;
+                            }
+                            Err(_) => {
+                                warn!(
+                                "Auto-detect invoice lookup timed out after {}s — returning 402",
+                                AUTODETECT_LOOKUP_TIMEOUT.as_secs()
+                            );
+                                return 402;
                             }
                         }
-                    });
-
-                    match payment_detector::PAYMENT_DETECTOR.get() {
-                        Some(detector) => {
-                            const AUTODETECT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
-                            match rt.block_on(async {
-                                tokio::time::timeout(
-                                    AUTODETECT_LOOKUP_TIMEOUT,
-                                    detector.lookup_settled_invoice(&payment_hash),
-                                )
-                                .await
-                            }) {
-                                Ok(Ok(Some(p))) => {
-                                    // Cache for future requests
-                                    if let Err(e) = cache_settled_preimage(&payment_hash, &p) {
-                                        warn!("⚠️ Failed to cache settled preimage: {}", e);
-                                    }
-                                    p
-                                }
-                                Ok(Ok(None)) => {
-                                    info!("⏳ Invoice not yet settled — returning 402");
-                                    return 402;
-                                }
-                                Ok(Err(e)) => {
-                                    error!("❌ Node invoice lookup failed: {}", e);
-                                    return 500;
-                                }
-                                Err(_) => {
-                                    warn!(
-                                            "Auto-detect invoice lookup timed out after {}s — returning 402",
-                                            AUTODETECT_LOOKUP_TIMEOUT.as_secs()
-                                        );
-                                    return 402;
-                                }
-                            }
-                        }
-                        None => {
-                            error!("❌ PAYMENT_DETECTOR not initialised");
-                            return 500;
-                        }
-                    }
-                };
+                    };
 
                 // 4. Check replay (skipped when indefinite access is enabled).
                 if !indefinite_access && is_preimage_used(&preimage_bytes) {
@@ -1940,41 +2146,9 @@ pub fn l402_access_handler(
                     return 401;
                 }
 
-                // 5. Build verifier (same logic as the classic path)
-                let mut verifier = Verifier::default();
-                verifier.satisfy_general(|predicate| {
-                    let predicate_str = match std::str::from_utf8(&predicate.0) {
-                        Ok(s) => s,
-                        Err(_) => return false,
-                    };
-                    if let Some(secs_str) = predicate_str.strip_prefix("ExpiresAt = ") {
-                        if let Ok(ts) = secs_str.parse::<i64>() {
-                            let current_time = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-                            return current_time <= ts;
-                        }
-                    }
-                    // `RequestMethod = …` and `RequestPath = …` must be
-                    // satisfied by the exact set only. Falling through to
-                    // `true` would let a token issued for one route or method
-                    // verify against any other, defeating the per-route and
-                    // per-method binding on the macaroon.
-                    if predicate_str.starts_with("RequestMethod = ")
-                        || predicate_str.starts_with("RequestPath = ")
-                    {
-                        return false;
-                    }
-                    true
-                });
-                for caveat in &caveats {
-                    if !caveat.starts_with("ExpiresAt = ") {
-                        verifier.satisfy_exact(caveat.clone().into());
-                    }
-                }
-
-                // 6. Verify macaroon signature + payment-hash binding
+                // 5. Verify the macaroon against the request binding. Scope,
+                // method, and expiry enforcement — including the auth-bypass
+                // guard — live in l402_middleware, shared with every consumer.
                 if preimage_bytes.len() != 32 {
                     error!("❌ Preimage from node is not 32 bytes");
                     return 500;
@@ -1983,9 +2157,9 @@ pub fn l402_access_handler(
                 preimage_arr.copy_from_slice(&preimage_bytes);
                 let preimage = lightning::types::payment::PaymentPreimage(preimage_arr);
 
-                match l402::verify_l402_with_verifier(
+                match l402::verify_l402_binding(
                     &mac,
-                    &mut verifier,
+                    binding,
                     module.middleware.root_key.clone(),
                     preimage,
                 ) {
@@ -2018,46 +2192,12 @@ pub fn l402_access_handler(
                         return 401;
                     }
 
-                    // Check expiry using verifier
-                    let mut verifier = Verifier::default();
-                    verifier.satisfy_general(|predicate| {
-                        let predicate_str = match std::str::from_utf8(&predicate.0) {
-                            Ok(s) => s,
-                            Err(_) => return false,
-                        };
-                        if let Some(secs_str) = predicate_str.strip_prefix("ExpiresAt = ") {
-                            if let Ok(ts) = secs_str.parse::<i64>() {
-                                let current_time = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(0);
-                                let is_valid = current_time <= ts;
-                                return is_valid;
-                            }
-                        }
-                        // `RequestMethod = …` and `RequestPath = …` must be
-                        // satisfied by the exact set only. Falling through to
-                        // `true` would let a token issued for one route or
-                        // method verify against any other, defeating the
-                        // per-route and per-method binding.
-                        if predicate_str.starts_with("RequestMethod = ")
-                            || predicate_str.starts_with("RequestPath = ")
-                        {
-                            return false;
-                        }
-                        true
-                    });
-
-                    // Add exact caveats, ignoring ExpiresAt
-                    for caveat in caveats {
-                        if !caveat.starts_with("ExpiresAt = ") {
-                            verifier.satisfy_exact(caveat.into());
-                        }
-                    }
-
-                    match l402::verify_l402_with_verifier(
+                    // Verify the macaroon against the request binding — scope,
+                    // method, and expiry enforcement (plus the auth-bypass guard)
+                    // all live in l402_middleware, shared with every consumer.
+                    match l402::verify_l402_binding(
                         &mac,
-                        &mut verifier,
+                        binding,
                         module.middleware.root_key.clone(),
                         preimage,
                     ) {
@@ -2109,10 +2249,18 @@ pub unsafe extern "C" fn init_module(cycle: *mut ngx_cycle_s) -> isize {
     // Initialize logger - this is critical for RUST_LOG to work
     let _ = env_logger::try_init();
 
+    install_crash_handler();
+
     info!("🚀 Starting L402 module initialization");
     ngx_log_error!(NGX_LOG_INFO, log, "Starting module initialization");
 
-    payment_detector::init_payment_detector();
+    // libsodium's RNG is only thread-safe once initialised, and every 402 mints
+    // a macaroon from multiple workers at once. Done here, before nginx forks.
+    if let Err(e) = macaroon::initialize() {
+        error!("❌ Failed to initialize macaroon crypto: {:?}", e);
+        return -1;
+    }
+
     manifest::init_env_snapshot();
 
     // Cache the LN backend type string for structured log lines. We can't
@@ -2193,6 +2341,8 @@ pub unsafe extern "C" fn init_module(cycle: *mut ngx_cycle_s) -> isize {
             if cashu_ecash_support {
                 cashu::restore_wallets_state().await;
                 cashu::reconcile_pending_proofs().await;
+                // Those ran as root; workers run as nginx.
+                cashu::reapply_db_ownership();
             }
 
             // Pre-warm the LNURL client cache in the master process so workers
@@ -2298,8 +2448,20 @@ pub unsafe extern "C" fn init_module(cycle: *mut ngx_cycle_s) -> isize {
                     cashu_redemption_logger::log_redemption(&msg);
                     info!("🔄 Cashu redemption iteration #{} starting...", iteration);
 
-                    // Run async redemption in the tokio runtime
-                    let result = thread_rt.block_on(async { cashu::redeem_to_lightning().await });
+                    // Guarded so a panic here doesn't end the thread and stop all
+                    // later redemption cycles.
+                    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || thread_rt.block_on(async { cashu::redeem_to_lightning().await }),
+                    )) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            cashu_redemption_logger::log_redemption(
+                                "❌ Panic during redemption — thread kept alive, retrying next cycle",
+                            );
+                            error!("❌ Panic during Cashu redemption; retrying next cycle");
+                            Ok(false)
+                        }
+                    };
 
                     match result {
                         Ok(true) => {
@@ -2836,6 +2998,7 @@ fn collect_route_snapshots() -> Vec<manifest::RouteSnapshot> {
                 price_msat: conf.amount_msat,
                 macaroon_timeout: conf.macaroon_timeout,
                 lnurl_addr: conf.lnurl_addr.clone(),
+                realm: conf.realm.clone(),
                 rate_limit: conf.invoice_rate_limit,
                 auto_detect_payment: conf.auto_detect_payment,
                 hidden: conf.manifest_hidden,
@@ -3038,6 +3201,48 @@ pub unsafe extern "C" fn ngx_http_l402_lnurl_set(
 
         conf.lnurl_addr = Some(lnurl_addr.clone());
         info!("Set L402 LNURL address to: {}", lnurl_addr);
+    }
+
+    std::ptr::null_mut()
+}
+
+/// `l402_realm "<name>";` — opt into location-scoped macaroon binding so one
+/// payment authorizes every path this location serves (see `request_binding`).
+///
+/// # Safety
+///
+/// An nginx config-parsing callback. `cf`, `conf`, and `(*cf).args` are
+/// guaranteed valid and non-null by nginx for the duration of the call, and
+/// `NGX_CONF_TAKE1` guarantees exactly one argument at `args.add(1)`.
+pub unsafe extern "C" fn ngx_http_l402_realm_set(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    // SAFETY: `cf`, `conf`, and `(*cf).args` are guaranteed valid by Nginx
+    // during config-parsing callbacks. `args.add(1)` is safe because
+    // NGX_CONF_TAKE1 ensures exactly one argument is present.
+    unsafe {
+        let conf = &mut *(conf as *mut ModuleConfig);
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let val = (*args.add(1)).to_str().unwrap_or_default().trim();
+
+        // The name goes verbatim into the `Realm = <name>` caveat, which is
+        // compared by exact match. Reject empty / whitespace / control chars so
+        // the caveat can't be malformed or ambiguous. Fails config parse (closed).
+        if val.is_empty() || val.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            error!(
+                "❌ l402_realm requires a non-empty name with no whitespace or control characters"
+            );
+            return c"l402_realm requires a non-empty name without whitespace".as_ptr()
+                as *mut c_char;
+        }
+
+        conf.realm = Some(val.to_string());
+        info!(
+            "⚙️ l402_realm = \"{}\" — one payment authorizes this whole location",
+            val
+        );
     }
 
     std::ptr::null_mut()

@@ -20,8 +20,41 @@ thread_local! {
 
 const MSAT_PER_SAT: u64 = 1000;
 
-// Database singleton using cdk-sqlite
+// Database singleton using cdk-sqlite. Opened in the master; `CASHU_DB_PID`
+// records who opened it so a forked worker knows to open its own instead of
+// reusing a connection that belongs to another process.
 static CASHU_DB: OnceLock<Arc<cdk_sqlite::WalletSqliteDatabase>> = OnceLock::new();
+static CASHU_DB_PID: OnceLock<u32> = OnceLock::new();
+static CASHU_DB_URL: OnceLock<String> = OnceLock::new();
+// This worker's own handle, opened lazily on first use after fork.
+static WORKER_DB: tokio::sync::OnceCell<Arc<cdk_sqlite::WalletSqliteDatabase>> =
+    tokio::sync::OnceCell::const_new();
+
+/// The database handle for the current process.
+///
+/// A SQLite connection belongs to the process that opened it, so a worker never
+/// reuses the master's — it opens its own on first use.
+async fn get_db() -> Result<Arc<cdk_sqlite::WalletSqliteDatabase>, String> {
+    if CASHU_DB_PID.get().copied() == Some(std::process::id()) {
+        return CASHU_DB
+            .get()
+            .cloned()
+            .ok_or_else(|| "Cashu database not initialized".to_string());
+    }
+
+    WORKER_DB
+        .get_or_try_init(|| async {
+            let url = CASHU_DB_URL
+                .get()
+                .ok_or_else(|| "Cashu database not configured".to_string())?;
+            cdk_sqlite::WalletSqliteDatabase::new(url.as_str())
+                .await
+                .map(Arc::new)
+                .map_err(|e| format!("Failed to open Cashu database: {:?}", e))
+        })
+        .await
+        .cloned()
+}
 
 // Whitelisted mints singleton
 static WHITELISTED_MINTS: OnceLock<HashSet<String>> = OnceLock::new();
@@ -78,10 +111,7 @@ async fn get_or_create_wallet(
         }
     }
 
-    let db = CASHU_DB
-        .get()
-        .ok_or_else(|| "Cashu database not initialized".to_string())?
-        .clone();
+    let db = get_db().await?;
     let seed = get_cached_seed();
     let wallet = Arc::new(
         cdk::wallet::Wallet::new(mint_url, unit.clone(), db, seed, None)
@@ -154,25 +184,87 @@ fn resolve_wallet_mnemonic(db_url: &str) -> Result<(), String> {
     let generated = ngx_l402_core::generate_mnemonic(GENERATED_MNEMONIC_WORDS)
         .map_err(|e| format!("Failed to generate wallet mnemonic: {}", e))?;
 
+    // The phrase goes to the 0600 file when there is one, otherwise to stderr:
+    // the operator still sees it at startup, and it stays out of error_log.
     match &file_path {
         Some(path) => match persist_mnemonic(path, &generated) {
             Ok(()) => warn!(
                 "⚠️ CASHU_WALLET_MNEMONIC not set — generated a new wallet mnemonic and saved it to {}. BACK IT UP; it controls all Cashu funds.",
                 path
             ),
-            Err(e) => warn!(
-                "⚠️ CASHU_WALLET_MNEMONIC not set — generated a new wallet mnemonic but could NOT persist it ({}). It will change on restart and orphan funds. Save this phrase and set CASHU_WALLET_MNEMONIC: {}",
-                e, generated
-            ),
+            Err(e) => {
+                warn!(
+                    "⚠️ CASHU_WALLET_MNEMONIC not set — generated a new wallet mnemonic but could NOT persist it ({}). It will change on restart and orphan funds. The phrase has been written to stderr; save it and set CASHU_WALLET_MNEMONIC.",
+                    e
+                );
+                eprintln!(
+                    "ngx_l402: save this Cashu wallet mnemonic and set CASHU_WALLET_MNEMONIC:\n{}",
+                    generated
+                );
+            }
         },
-        None => warn!(
-            "⚠️ CASHU_WALLET_MNEMONIC not set and no persist path available — using an EPHEMERAL mnemonic that changes on restart. Save this phrase and set CASHU_WALLET_MNEMONIC: {}",
-            generated
-        ),
+        None => {
+            warn!(
+                "⚠️ CASHU_WALLET_MNEMONIC not set and no persist path available — using an EPHEMERAL mnemonic that changes on restart. The phrase has been written to stderr; save it and set CASHU_WALLET_MNEMONIC."
+            );
+            eprintln!(
+                "ngx_l402: save this Cashu wallet mnemonic and set CASHU_WALLET_MNEMONIC:\n{}",
+                generated
+            );
+        }
     }
 
     let _ = WALLET_MNEMONIC.set(generated);
     Ok(())
+}
+
+/// Give the database files the same owner as their directory.
+///
+/// The master creates them as root; the workers that use them run as nginx.
+/// The data directory already names that user, so follow it.
+fn set_db_ownership(db_url: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path = std::path::Path::new(
+            db_url
+                .trim()
+                .trim_start_matches("sqlite://")
+                .trim_start_matches("sqlite:"),
+        );
+        let owner = path
+            .parent()
+            .and_then(|dir| std::fs::metadata(dir).ok())
+            .map(|m| (m.uid(), m.gid()));
+
+        // -wal and -shm hold live data too.
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let file = std::path::PathBuf::from(name);
+            if !file.exists() {
+                continue;
+            }
+            if let Some((uid, gid)) = owner {
+                let _ = std::os::unix::fs::chown(&file, Some(uid), Some(gid));
+            }
+            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o660));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = db_url;
+}
+
+/// Re-apply ownership once the master has finished its start-up writes.
+///
+/// Wallet restore and proof reconciliation run as root after the database is
+/// created, and SQLite writes -wal/-shm on the first write rather than at open,
+/// so they can appear after `initialize_cashu` has already set ownership.
+pub fn reapply_db_ownership() {
+    if let Some(url) = CASHU_DB_URL.get() {
+        set_db_ownership(url);
+    }
 }
 
 /// Decide where to persist a generated mnemonic. Prefers
@@ -199,13 +291,32 @@ fn wallet_mnemonic_file_path(db_url: &str) -> Option<String> {
 }
 
 /// Persist the mnemonic to `path` with owner-only permissions where supported.
+///
+/// On unix the file is created with mode 0600 up front, so it is never visible
+/// at the umask's default permissions.
 fn persist_mnemonic(path: &str, mnemonic: &str) -> Result<(), String> {
-    std::fs::write(path, format!("{}\n", mnemonic))
-        .map_err(|e| format!("write {}: {}", path, e))?;
     #[cfg(unix)]
     {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("open {}: {}", path, e))?;
+        f.write_all(format!("{}\n", mnemonic).as_bytes())
+            .map_err(|e| format!("write {}: {}", path, e))?;
+        // An existing file keeps its own mode on open, so set it explicitly too.
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, format!("{}\n", mnemonic))
+            .map_err(|e| format!("write {}: {}", path, e))?;
     }
     Ok(())
 }
@@ -417,6 +528,8 @@ pub fn initialize_cashu(db_url: &str) -> Result<(), String> {
     // that owns this DB's funds (changed/typo'd mnemonic would orphan them).
     check_wallet_fingerprint(db_url)?;
 
+    let _ = CASHU_DB_URL.set(db_url.to_string());
+
     // Create runtime for async initialization
     let rt = Runtime::new().expect("Failed to create runtime");
 
@@ -426,6 +539,8 @@ pub fn initialize_cashu(db_url: &str) -> Result<(), String> {
             Ok(db) => {
                 info!("✅ Cashu SQLite database initialized successfully with WAL mode");
                 let _ = CASHU_DB.set(Arc::new(db));
+                let _ = CASHU_DB_PID.set(std::process::id());
+                set_db_ownership(db_url);
 
                 Ok(())
             }
@@ -492,10 +607,10 @@ pub async fn restore_wallets_state() {
         }
     };
 
-    let db = match CASHU_DB.get() {
-        Some(db) => db.clone(),
-        None => {
-            warn!("⚠️ Cashu database not initialized before restore");
+    let db = match get_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("⚠️ Cashu database unavailable before restore: {}", e);
             return;
         }
     };
@@ -551,10 +666,13 @@ pub async fn reconcile_pending_proofs() {
         None => return,
     };
 
-    let db = match CASHU_DB.get() {
-        Some(db) => db.clone(),
-        None => {
-            warn!("⚠️ Cashu database not initialized before pending-proof reconciliation");
+    let db = match get_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!(
+                "⚠️ Cashu database unavailable before pending-proof reconciliation: {}",
+                e
+            );
             return;
         }
     };
@@ -1308,10 +1426,7 @@ pub async fn redeem_to_lightning() -> Result<bool, String> {
     info!("🚀 Starting smart Cashu token redemption process...");
 
     // Get database
-    let db = CASHU_DB
-        .get()
-        .ok_or_else(|| "Cashu database not initialized".to_string())?
-        .clone();
+    let db = get_db().await?;
 
     // Use whitelisted mints for redemption check
     // If no whitelisted mints are configured, we can't redeem

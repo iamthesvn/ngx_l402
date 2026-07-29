@@ -34,9 +34,20 @@ COPY index.html /usr/share/nginx/html/protected/index.html
 COPY index.html /usr/share/nginx/html/protected-timeout/index.html
 COPY index.html /usr/share/nginx/html/protected-indefinite/index.html
 COPY index.html /usr/share/nginx/html/rate-limited/index.html
+COPY index.html /usr/share/nginx/html/realm-a/index.html
+COPY index.html /usr/share/nginx/html/realm-b/index.html
 COPY index.html /usr/share/nginx/html/shadow/index.html
 COPY index.html /usr/share/nginx/html/tenant1/index.html
 COPY index.html /usr/share/nginx/html/tenant2/index.html
+
+# Cashu data dir, owned by nginx as in the manual install. A mounted volume
+# hides the ownership set at build time, so the entrypoint sets it again.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'd=$(dirname "${CASHU_DB_PATH:-/app/data/cashu_tokens.db}")' \
+    'mkdir -p "$d" && chown -R nginx:nginx "$d" && chmod 750 "$d"' \
+    > /docker-entrypoint.d/05-cashu-data-perms.sh \
+    && chmod +x /docker-entrypoint.d/05-cashu-data-perms.sh
 
 USER root
 
