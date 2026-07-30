@@ -69,4 +69,6 @@ docs](https://ngx-l402.org/docs/cashu.html).
 
 - **1 sat pricing + per-IP invoice rate limiting** (`10r/m`) keep abuse boring.
 - Payments settle to your `LNURL_ADDRESS` — the demo literally pays you.
+- Cashu payments don't reach that address — they stay as ecash in the `cashu`
+  volume, held against the mint, until `CASHU_REDEEM_ON_LIGHTNING` melts them.
 - Redis gives replay protection across workers (and fails closed if down).
