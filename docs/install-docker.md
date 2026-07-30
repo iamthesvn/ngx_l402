@@ -178,8 +178,7 @@ docker stop l402-nginx
 ## Specific Versions
 
 ```bash
-docker pull ghcr.io/ngx-l402/ngx-l402:1.2.6
-
-# Releases up to v1.2.7 were published under the previous namespace:
-docker pull ghcr.io/dhananjaypurohit/ngx_l402:v1.2.5
+docker pull ghcr.io/ngx-l402/ngx-l402:<version>   # e.g. 1.2.8
 ```
+
+See the [available tags](https://github.com/orgs/ngx-l402/packages/container/package/ngx-l402).

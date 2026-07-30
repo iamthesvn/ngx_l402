@@ -36,7 +36,9 @@ For local contributor setup on macOS (Docker nginx recommended), see `docs/macos
 
 > Requires **NGINX 1.28.0** or later.
 >
-> Pre-built binaries are provided for NGINX **1.28.0, 1.28.3, 1.29.8, 1.30.3, and 1.31.2** (see [Releases](https://github.com/ngx-l402/ngx-l402/releases)). For other versions, build from source:
+> Pre-built binaries are published for several NGINX versions — see the assets on
+> the [latest release](https://github.com/ngx-l402/ngx-l402/releases/latest). For
+> anything else, build from source:
 > ```
 > docker build --build-arg NGX_VERSION=<your-version> -t ngx_l402 .
 > ```
