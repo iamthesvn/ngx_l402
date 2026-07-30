@@ -14,8 +14,21 @@ services:
       - REDIS_URL=redis://redis:6379
       - L402_SERVICE_NAME=ngx-l402 demo
       - L402_SERVICE_DESCRIPTION=Live demo gateway for ngx-l402.org — 1 sat per request.
+      # Second payment path: send a Cashu token in X-Cashu instead of paying the
+      # invoice. Standard mode — the module swaps the token at the mint, so any
+      # ordinary wallet works and there is no P2PK key to hold.
+      - CASHU_ECASH_SUPPORT=true
+      - CASHU_DB_PATH=/app/data/cashu_tokens.db
+      # Required in public deployments: without it, anyone can present tokens
+      # from a mint they run themselves and get in free. Swap in the mints you
+      # trust.
+      - CASHU_WHITELISTED_MINTS=https://mint.minibits.cash/Bitcoin,https://mint.coinos.io
+      # CASHU_WALLET_MNEMONIC is left unset: one is generated and saved beside
+      # the DB on the `cashu` volume at first run. Received tokens are real
+      # value — back that volume up, or set your own phrase here.
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - cashu:/app/data
     restart: unless-stopped
 
   redis:
@@ -28,3 +41,4 @@ services:
 
 volumes:
   redis:
+  cashu:
