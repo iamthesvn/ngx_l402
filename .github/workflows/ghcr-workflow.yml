@@ -1,13 +1,11 @@
 name: Build and Publish Docker Images
 
+# Invoked by tests.yml on a v* tag, once the tests pass — not by the tag itself.
+# `latest` moves on every publish and cannot be un-moved, so an image must never
+# ship from a commit whose tests failed. The caller grants the token its
+# packages: write scope.
 on:
-  push:
-    tags:
-      - 'v*'
-
-permissions:
-  contents: read
-  packages: write
+  workflow_call:
 
 env:
   REGISTRY: ghcr.io
