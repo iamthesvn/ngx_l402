@@ -1,6 +1,6 @@
 services:
   gateway:
-    image: ghcr.io/dhananjaypurohit/ngx_l402:latest
+    image: ghcr.io/ngx-l402/ngx-l402:latest
     container_name: l402-demo-gateway
     depends_on:
       - redis
