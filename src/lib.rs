@@ -97,9 +97,50 @@ fn manifest_registry() -> &'static std::sync::Mutex<Vec<RouteRegistration>> {
     MANIFEST_REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// Connection pool for Redis. Checked out connections are returned automatically on drop.
-/// Pool size is configurable via REDIS_POOL_SIZE (default: cpu_count * 3, min 5, max 50).
+/// How to reach Redis, recorded at startup. Pool size is configurable via
+/// REDIS_POOL_SIZE (default: cpu_count * 3, min 5, max 50).
+static REDIS_URL: OnceLock<String> = OnceLock::new();
+static REDIS_POOL_SIZE: OnceLock<u32> = OnceLock::new();
+/// This process's pool, opened on first use. Checked out connections are
+/// returned automatically on drop.
 static REDIS_POOL: OnceLock<Pool<RedisClient>> = OnceLock::new();
+
+/// Redemption interval, set by the master when redemption is on; unset means
+/// off. Workers read this instead of the environment, so they cannot reach a
+/// different answer and quietly skip the work.
+static CASHU_REDEEM_INTERVAL: OnceLock<u64> = OnceLock::new();
+
+/// The Redis pool for this process, opened on first use.
+///
+/// Never built before nginx forks: r2d2 keeps three background threads for the
+/// life of a pool, and a worker inheriting them gets their locks without the
+/// threads that release them — it then dies in `parking_lot` on first checkout.
+fn redis_pool() -> Option<&'static Pool<RedisClient>> {
+    if let Some(pool) = REDIS_POOL.get() {
+        return Some(pool);
+    }
+
+    let url = REDIS_URL.get()?;
+    let size = REDIS_POOL_SIZE.get().copied().unwrap_or(5);
+    let manager = match RedisClient::open(url.as_str()) {
+        Ok(manager) => manager,
+        Err(e) => {
+            error!("❌ Failed to create the Redis client: {}", e);
+            return None;
+        }
+    };
+    match Pool::builder().max_size(size).build(manager) {
+        Ok(pool) => {
+            // A racing thread may have won; either way `get` returns the winner.
+            let _ = REDIS_POOL.set(pool);
+            REDIS_POOL.get()
+        }
+        Err(e) => {
+            error!("❌ Failed to build the Redis pool: {}", e);
+            None
+        }
+    }
+}
 
 // Cached environment variables — read once at startup, fixed for process lifetime.
 // Changing these requires a full restart (SIGHUP will not reload them).
@@ -372,7 +413,7 @@ pub async fn get_or_create_lnurl_client(
 /// the true gate and closes the TOCTOU window between concurrent workers.
 /// Fails open (returns false) if Redis is unavailable.
 fn is_preimage_used(preimage: &[u8]) -> bool {
-    let Some(pool) = REDIS_POOL.get() else {
+    let Some(pool) = redis_pool() else {
         return false;
     };
     let mut conn = match pool.get() {
@@ -440,7 +481,7 @@ fn handle_preimage_claim(result: Result<bool, ReplayClaimError>) -> isize {
 /// Returns Ok(true) if stored successfully (first use), Ok(false) if already existed (race with another worker).
 /// Called ONLY after successful verification to avoid burning preimages on transient failures.
 fn store_preimage_as_used(preimage: &[u8]) -> Result<bool, ReplayClaimError> {
-    let pool = REDIS_POOL.get().ok_or(ReplayClaimError::NotConfigured)?;
+    let pool = redis_pool().ok_or(ReplayClaimError::NotConfigured)?;
 
     let mut conn = pool
         .get()
@@ -481,7 +522,7 @@ fn preimage_redis_key(preimage: &[u8]) -> String {
 /// Returns true if token is already used, false if it's new.
 /// Fails open (returns false) if Redis is unavailable.
 pub fn is_cashu_token_used(token: &str) -> bool {
-    let Some(pool) = REDIS_POOL.get() else {
+    let Some(pool) = redis_pool() else {
         warn!("⚠️ Redis not configured - Cashu token replay protection limited to memory");
         return false;
     };
@@ -516,7 +557,7 @@ pub fn is_cashu_token_used(token: &str) -> bool {
 /// Atomically store a Cashu token as used via SET NX EX (single round-trip).
 /// Called ONLY after successful verification to avoid burning tokens on transient failures.
 pub fn store_cashu_token_as_used(token: &str) -> Result<bool, ReplayClaimError> {
-    let pool = REDIS_POOL.get().ok_or(ReplayClaimError::NotConfigured)?;
+    let pool = redis_pool().ok_or(ReplayClaimError::NotConfigured)?;
 
     let mut conn = pool
         .get()
@@ -549,7 +590,7 @@ pub fn store_cashu_token_as_used(token: &str) -> Result<bool, ReplayClaimError> 
 /// retry would be rejected until the TTL expired even though the proofs were
 /// never persisted. Best-effort — failures are logged, not propagated.
 pub fn release_cashu_token(token: &str) {
-    let Some(pool) = REDIS_POOL.get() else {
+    let Some(pool) = redis_pool() else {
         return;
     };
     let mut conn = match pool.get() {
@@ -581,7 +622,7 @@ fn cashu_token_redis_key(token: &str) -> String {
 /// Look up a previously-cached preimage for a settled invoice.
 /// Key: `l402:settled:<payment_hash_hex>` → `<preimage_hex>`
 pub fn get_cached_settled_preimage(payment_hash: &[u8]) -> Option<Vec<u8>> {
-    let pool = REDIS_POOL.get()?;
+    let pool = redis_pool()?;
     let mut conn = pool.get().ok()?;
     let hash_hex = hex::encode(payment_hash);
     let redis_key = format!("l402:settled:{}", hash_hex);
@@ -591,7 +632,7 @@ pub fn get_cached_settled_preimage(payment_hash: &[u8]) -> Option<Vec<u8>> {
 
 /// Cache a preimage for a settled invoice with TTL (same as preimage TTL).
 pub fn cache_settled_preimage(payment_hash: &[u8], preimage: &[u8]) -> Result<(), String> {
-    let pool = REDIS_POOL.get().ok_or("Redis not configured")?;
+    let pool = redis_pool().ok_or("Redis not configured")?;
     let mut conn = pool
         .get()
         .map_err(|e| format!("Failed to get Redis connection: {}", e))?;
@@ -672,7 +713,13 @@ impl L402Module {
     pub async fn new() -> Self {
         info!("🚀 Creating new L402Module");
 
-        // Initialize Redis client if URL is configured
+        // Record how to reach Redis; do not build the pool here.
+        //
+        // r2d2 keeps three background threads for the life of a pool, and this
+        // runs in the master before nginx forks. Workers would inherit those
+        // threads' locks without the threads, then die in parking_lot on their
+        // first checkout. The master never reads Redis anyway — each worker
+        // builds its own pool on first use, in `redis_pool`.
         if let Ok(redis_url) = std::env::var("REDIS_URL") {
             // Pool size: configurable via REDIS_POOL_SIZE.
             // Default heuristic: nginx workers are CPU-bound, Redis ops are fast,
@@ -686,21 +733,18 @@ impl L402Module {
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(default_pool_size);
 
+            // Validate the URL now, so a typo is a startup error rather than a
+            // surprise on the first request in every worker.
             match RedisClient::open(redis_url.clone()) {
-                Ok(manager) => match Pool::builder().max_size(pool_size).build(manager) {
-                    Ok(pool) => {
-                        if REDIS_POOL.set(pool).is_ok() {
-                            info!(
-                                "✅ Redis connection pool ready (max_size={}) at {}",
-                                pool_size,
-                                ngx_l402_core::redact_redis_url(&redis_url)
-                            );
-                        } else {
-                            error!("❌ Failed to register Redis pool in OnceLock");
-                        }
-                    }
-                    Err(e) => error!("❌ Failed to build Redis connection pool: {}", e),
-                },
+                Ok(_) => {
+                    let _ = REDIS_URL.set(redis_url.clone());
+                    let _ = REDIS_POOL_SIZE.set(pool_size);
+                    info!(
+                        "✅ Redis configured (max_size={}) at {} — pool opens per worker",
+                        pool_size,
+                        ngx_l402_core::redact_redis_url(&redis_url)
+                    );
+                }
                 Err(e) => error!("❌ Failed to create Redis client: {}", e),
             }
         } else {
@@ -1090,7 +1134,7 @@ impl L402Module {
     /// in a single Redis pipeline. Two GETs become one round-trip.
     /// Returns `(0, None)` if Redis is unavailable or the keys are missing.
     pub fn get_dynamic_config(&self, path: &str) -> (i64, Option<String>) {
-        let Some(pool) = REDIS_POOL.get() else {
+        let Some(pool) = redis_pool() else {
             return (0, None);
         };
         let Ok(mut conn) = pool.get() else {
@@ -1423,7 +1467,7 @@ pub static mut ngx_http_l402_module: ngx_module_t = ngx_module_t {
 
     init_master: None,
     init_module: Some(init_module as unsafe extern "C" fn(*mut ngx_cycle_s) -> isize),
-    init_process: None,
+    init_process: Some(init_process as unsafe extern "C" fn(*mut ngx_cycle_s) -> isize),
     init_thread: None,
     exit_thread: None,
     exit_process: None,
@@ -1901,9 +1945,11 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         // l402_middleware's lnurl.rs can panic on network errors). Without this
         // guard a panic would unwind through nginx's C stack — undefined
         // behaviour in a cdylib that crashes the worker process (curl exit 52).
-        // Backends bound connecting, not the call, so an unanswered invoice
-        // request would hold this worker until the client gave up.
-        const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(10);
+        // Backends bound connecting, not the call, so an unanswered request
+        // would hold this worker until the client gave up. Generous because a
+        // worker's first request builds its own channel: this catches a request
+        // that will never finish, it is not a latency budget.
+        const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(25);
         let header_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async {
                 tokio::time::timeout(
@@ -2413,19 +2459,120 @@ pub unsafe extern "C" fn init_module(cycle: *mut ngx_cycle_s) -> isize {
         == "true";
 
     if redeem_on_lightning && cashu_ecash_support {
-        ngx_log_error!(NGX_LOG_INFO, log, "Automatic Cashu redemption enabled");
-
-        // Get redemption interval
+        // Decided here, acted on in a worker: a thread started here would still
+        // be running when nginx forks, and the child inherits its locks without
+        // the threads that hold them.
         let interval_secs = std::env::var("CASHU_REDEMPTION_INTERVAL_SECS")
-            .unwrap_or_else(|_| "3600".to_string()) // Default 1 hour
+            .unwrap_or_else(|_| "3600".to_string())
             .parse::<u64>()
             .unwrap_or(3600);
+        let _ = CASHU_REDEEM_INTERVAL.set(interval_secs);
+        // Here, while still root: the log directory is root-owned and the
+        // redemption loop writes from a worker.
+        #[cfg(unix)]
+        cashu_redemption_logger::prepare_log_file(cashu::data_dir_owner());
+        ngx_log_error!(
+            NGX_LOG_INFO,
+            log,
+            "Automatic Cashu redemption enabled (starts in a worker)"
+        );
+    }
 
-        let Some(_module) = MODULE.get() else {
-            error!("Module not initialized — skipping Cashu redemption");
-            return 0;
+    0
+}
+
+/// Per-worker init, after `fork()`.
+///
+/// Deliberately does almost nothing: work here runs in every worker, and a
+/// failure must not stop one starting. Always returns NGX_OK — returning an
+/// error marks the worker unrespawnable and takes the server down with it.
+///
+/// # Safety
+/// Called by nginx once per worker with a valid cycle pointer.
+pub unsafe extern "C" fn init_process(cycle: *mut ngx_cycle_s) -> isize {
+    let Some(&interval_secs) = CASHU_REDEEM_INTERVAL.get() else {
+        return 0; // redemption off — the master decided
+    };
+
+    // nginx's log rather than the Rust one, so it is visible either way: a
+    // worker that never starts redeeming should not look like one that did.
+    if !cycle.is_null() {
+        let log = unsafe { (*cycle).log };
+        if !log.is_null() {
+            ngx_log_error!(NGX_LOG_INFO, log, "Waiting for the Cashu redemption lease");
+        }
+    }
+
+    start_cashu_redemption_in_worker(interval_secs);
+    0
+}
+
+/// Start the Cashu redemption loop in this worker, if it wins the lease.
+///
+/// Exactly one worker should redeem. The lease is an exclusive `flock` on a
+/// file beside the wallet database, held for the winner's lifetime and released
+/// by the kernel when that worker exits — a crash included.
+///
+/// Every worker waits on it rather than asking once, because the holder does not
+/// always die: on reload the new workers start while the old one is still
+/// draining, and it releases the lock only after they would have given up.
+fn start_cashu_redemption_in_worker(interval_secs: u64) {
+    #[cfg(unix)]
+    {
+        // From the master: CASHU_DB_PATH is not readable in a worker.
+        let Some(db_path) = cashu::db_path() else {
+            error!("❌ Cashu database path unknown in this worker — not redeeming");
+            return;
         };
+        let lock_path = format!("{}.redeem.lock", db_path);
 
+        let _ = std::thread::Builder::new()
+            .name("cashu_redeem_lease".into())
+            .spawn(move || {
+                use std::os::unix::io::AsRawFd;
+
+                let file = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&lock_path)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("❌ Cannot open the redemption lease {}: {}", lock_path, e);
+                        return;
+                    }
+                };
+
+                // Blocking: the kernel parks this thread and wakes exactly one
+                // waiter when the holder releases. No polling, and handover is
+                // immediate rather than up to an interval late. Only a signal
+                // can interrupt it, so retry on EINTR.
+                loop {
+                    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                        break;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        error!("❌ Waiting for the Cashu redemption lease failed: {}", err);
+                        return;
+                    }
+                }
+
+                // Held until this worker exits, when the kernel closes the fd
+                // and hands the lease to the next waiter.
+                std::mem::forget(file);
+                info!("🔄 This worker took the Cashu redemption lease");
+                spawn_cashu_redemption_thread(interval_secs);
+            });
+    }
+
+    #[cfg(not(unix))]
+    spawn_cashu_redemption_thread(interval_secs);
+}
+
+fn spawn_cashu_redemption_thread(interval_secs: u64) {
+    {
         // Spawn redemption task in a separate thread to avoid blocking nginx
         let _ = std::thread::Builder::new()
             .name("cashu_redemption".into())
@@ -2508,7 +2655,6 @@ pub unsafe extern "C" fn init_module(cycle: *mut ngx_cycle_s) -> isize {
                 }
             });
     }
-    0
 }
 
 /// Handle dry-run (shadow) mode: evaluate everything, log + increment metrics,
@@ -3301,7 +3447,7 @@ fn get_client_ip(request: *mut ngx_http_request_t) -> String {
 
 /// Fixed-window INCR+EXPIRE counter. Fails open if Redis is unavailable.
 fn check_invoice_rate_limit(ip: &str, path: &str, max_requests: u32, window_secs: u64) -> bool {
-    let Some(pool) = REDIS_POOL.get() else {
+    let Some(pool) = redis_pool() else {
         warn!("Redis not configured - invoice rate limiting disabled");
         return true;
     };

@@ -369,8 +369,34 @@ jobs:
       - name: Start LND node, LND node receiver, cashu-mint and Tor
         run: |
           docker-compose -f docker-compose.yml up -d --no-deps bitcoind tor lndnode lndnode-receiver cashu-mint
-          echo "waiting for 30 seconds..."
-          sleep 30
+          # The next step drives bitcoin-cli straight away, so wait for it.
+          for i in $(seq 1 90); do
+            docker exec bitcoind bitcoin-cli -regtest -rpcuser=user -rpcpassword=pass getblockchaininfo >/dev/null 2>&1 && break
+            if [ "$i" -eq 90 ]; then
+              echo "❌ bitcoind did not answer RPC after 90s"
+              docker logs bitcoind 2>&1 | tail -30
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "✅ bitcoind answering RPC after ${i}s"
+
+          # The same step funds both LND nodes, and the first check that they
+          # are up is far below that.
+          for node in "lndnode" "lndnode-receiver --rpcserver=127.0.0.1:10010"; do
+            set -- $node
+            name=$1; shift
+            for i in $(seq 1 120); do
+              docker exec "$name" lncli "$@" -n regtest getinfo >/dev/null 2>&1 && break
+              if [ "$i" -eq 120 ]; then
+                echo "❌ $name did not answer after 120s"
+                docker logs "$name" 2>&1 | tail -30
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "✅ $name answering after ${i}s"
+          done
 
       - name: Verify Bitcoin daemon Service, create wallet and fund lndnode and lndnode-receiver
         run: |
@@ -412,11 +438,19 @@ jobs:
           new_addr=$(docker exec bitcoind bitcoin-cli -regtest -rpcuser=user -rpcpassword=pass -rpcwallet=$wallet_name getnewaddress)
           docker exec bitcoind bitcoin-cli -regtest -rpcuser=user -rpcpassword=pass -rpcwallet=$wallet_name generatetoaddress 6 "$new_addr"
 
-          # Print final LND node balance
-          final_balance=$(docker exec lndnode lncli -n regtest walletbalance | jq -r '.confirmed_balance')
-          echo "Final LND node balance: $final_balance sats"
-
-          echo "✅ LND node funded successfully!"
+          # The blocks are mined, but LND credits the funding only once it has
+          # caught up with them. Reporting success at zero hides that.
+          for i in $(seq 1 120); do
+            final_balance=$(docker exec lndnode lncli -n regtest walletbalance 2>/dev/null | jq -r '.confirmed_balance // 0')
+            [ "${final_balance:-0}" -gt 0 ] && break
+            if [ "$i" -eq 120 ]; then
+              echo "❌ LND node still shows 0 sats after 120s"
+              docker exec lndnode lncli -n regtest getinfo || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "✅ LND node funded successfully: ${final_balance} sats"
 
           # ------- FUND LND-receiver NODE -------
           echo "Funding LND-receiver node..."
@@ -447,7 +481,24 @@ jobs:
           echo "Connecting LND-receiver to LND node..."
           docker exec lndnode-receiver lncli --network=regtest --rpcserver=127.0.0.1:10010 connect "$LNDNODE_PUBKEY"@lndnode:9735 || true
 
-          # Step 3: Open channel from receiver to LND node
+          # Step 3: Open channel from receiver to LND node.
+          # openchannel refuses until the wallet has caught up with the chain
+          # and the funding is confirmed — answering RPC is not the same thing.
+          for i in $(seq 1 120); do
+            synced=$(docker exec lndnode-receiver lncli --network=regtest --rpcserver=127.0.0.1:10010 getinfo 2>/dev/null | jq -r '.synced_to_chain // false')
+            bal=$(docker exec lndnode-receiver lncli --network=regtest --rpcserver=127.0.0.1:10010 walletbalance 2>/dev/null | jq -r '.confirmed_balance // 0')
+            if [ "$synced" = "true" ] && [ "${bal:-0}" -gt 0 ]; then
+              echo "✅ lndnode-receiver synced with ${bal} sat confirmed (after ${i}s)"
+              break
+            fi
+            if [ "$i" -eq 120 ]; then
+              echo "❌ lndnode-receiver not ready after 120s (synced=$synced balance=${bal:-0})"
+              docker exec lndnode-receiver lncli --network=regtest --rpcserver=127.0.0.1:10010 getinfo || true
+              exit 1
+            fi
+            sleep 1
+          done
+
           echo "Opening channel from LND-receiver to LND node..."
           docker exec lndnode-receiver lncli --network=regtest --rpcserver=127.0.0.1:10010 openchannel --node_key="$LNDNODE_PUBKEY" --local_amt=1000000
 
@@ -485,8 +536,23 @@ jobs:
           echo "Pushing liquidity from lndnode to lndnode-receiver..."
           INVOICE=$(docker exec lndnode lncli -n regtest addinvoice --amt=8000 | jq -r '.payment_request')
           docker exec lndnode-receiver lncli -n regtest --rpcserver=127.0.0.1:10010 payinvoice --force "$INVOICE"
-          sleep 3
-          echo "✅ Liquidity pushed successfully!"
+          # This push is lndnode's only outbound, and every later test spends
+          # from it. Unsettled, they all fail with insufficient balance far from
+          # here — so confirm it landed rather than sleeping on it.
+          bal=0
+          for i in $(seq 1 60); do
+            bal=$(docker exec lndnode lncli -n regtest channelbalance 2>/dev/null \
+              | jq -r '(.local_balance.sat // .balance // 0) | tonumber' 2>/dev/null || echo 0)
+            [ "${bal:-0}" -ge 7000 ] && break
+            if [ "$i" -eq 60 ]; then
+              echo "❌ lndnode outbound is ${bal:-0} sat after 60s — tests cannot pay"
+              docker exec lndnode lncli -n regtest listchannels || true
+              docker exec lndnode-receiver lncli -n regtest --rpcserver=127.0.0.1:10010 listchannels || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "✅ Liquidity pushed successfully (lndnode outbound: ${bal} sat)"
 
       - name: Extract Macaroon and Cert Paths
         run: |
@@ -709,7 +775,8 @@ jobs:
           
           echo "Starting nginx-bolt12 with BOLT12_OFFER..."
           export BOLT12_OFFER
-          docker-compose -f docker-compose.yml up -d nginx-bolt12
+          # --no-deps, or compose recreates the cln that just made this offer.
+          docker-compose -f docker-compose.yml up -d --no-deps nginx-bolt12
           source .github/scripts/ci-wait.sh
           # Free route first — a 402 needs the CLN socket the chmod unlocks.
           wait_http http://0.0.0.0:8000/ 200 90 || { docker logs nginx-bolt12; exit 1; }
@@ -1021,7 +1088,7 @@ jobs:
         run: |
           source .github/scripts/ci-wait.sh
           echo "Testing CLN Autodetect Payment..."
-          docker-compose -f docker-compose.yml up -d nginx-cln
+          docker-compose -f docker-compose.yml up -d --no-deps nginx-cln
           # Free route first — a 402 needs the CLN socket the chmod unlocks.
           wait_http http://0.0.0.0:8000/ 200 90 || { docker logs nginx-cln; exit 1; }
           docker exec nginx-cln chmod 777 /root /root/.lightning /root/.lightning/regtest
@@ -1743,7 +1810,7 @@ jobs:
           # 1. 402 response must carry an X-Cashu NUT-24 payment request header
           echo "Checking X-Cashu header on 402 response..."
           p2pk_resp=$(curl -s -i --max-time 30 http://0.0.0.0:8000/protected) || true
-          p2pk_code=$(echo "$p2pk_resp" | grep "^HTTP" | tail -1 | awk '{print $2}')
+          p2pk_code=$(echo "$p2pk_resp" | grep "^HTTP" | tail -1 | awk '{print $2}'); p2pk_code=${p2pk_code:-000}
           if [ "$p2pk_code" -ne 402 ]; then
             echo "❌ Expected 402 in P2PK mode, got $p2pk_code"
             docker logs nginx-lnd | tail -30
@@ -1796,7 +1863,7 @@ jobs:
           else
             p2pk_auth_resp=$(curl -s -w "\n%{http_code}" --max-time 60 -L \
               -H "Authorization: Cashu $P2PK_TOKEN" http://0.0.0.0:8000/protected) || true
-            p2pk_auth_code=$(echo "$p2pk_auth_resp" | tail -n1)
+            p2pk_auth_code=$(echo "$p2pk_auth_resp" | tail -n1); p2pk_auth_code=${p2pk_auth_code:-000}
             if [ "$p2pk_auth_code" -ne 200 ]; then
               echo "❌ P2PK-locked token rejected (got $p2pk_auth_code), expected 200"
               docker logs nginx-lnd | tail -30
@@ -2191,7 +2258,8 @@ jobs:
           # before stopping, so nginx-lnurl can start fresh with its own mnemonic.
           docker exec nginx-lnd rm -f /app/data/wallet.fingerprint /app/data/wallet.mnemonic
           docker-compose -f docker-compose.yml stop nginx-lnd
-          docker-compose -f docker-compose.yml up -d nginx-lnurl
+          # --no-deps, or redis loses its replay and pricing state.
+          docker-compose -f docker-compose.yml up -d --no-deps nginx-lnurl
           sleep 15
 
       - name: Run Integration Tests - Multi-tenant LNURL Cashu Redemption
@@ -2360,7 +2428,7 @@ jobs:
       - name: Start nginx-lnc
         run: |
           echo "Starting nginx-lnc with LNC configuration..."
-          docker-compose -f docker-compose.yml up -d nginx-lnc
+          docker-compose -f docker-compose.yml up -d --no-deps nginx-lnc
           sleep 15
 
       - name: Run Integration Tests - LNC
