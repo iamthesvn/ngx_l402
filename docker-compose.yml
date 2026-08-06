@@ -37,7 +37,7 @@ services:
 
   # Local Nostr relay for the NWC tests.
   nostr-relay:
-    image: scsibug/nostr-rs-relay:latest
+    image: scsibug/nostr-rs-relay:0.10.0
     container_name: nostr-relay
     ports:
       - "7000:8080"
