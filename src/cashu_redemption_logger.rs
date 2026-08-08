@@ -14,40 +14,42 @@ static OPEN_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
 /// but redemption writes from a worker. Ownership follows the Cashu data
 /// directory, which the operator already sets — the same rule the database uses.
 pub fn prepare_log_file(data_dir_owner: Option<(u32, u32)>) {
-    if let Err(e) = std::fs::OpenOptions::new()
+    // Ownership and mode are applied to the open descriptor, never to the path:
+    // a path-based chown/chmod resolves symlinks, so anyone able to pre-create
+    // LOG_FILE_PATH as a link could redirect them onto an arbitrary file.
+    let file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(LOG_FILE_PATH)
     {
-        error!("Cannot create {}: {}", LOG_FILE_PATH, e);
-        return;
-    }
+        Ok(file) => file,
+        Err(e) => {
+            error!("Cannot create {}: {}", LOG_FILE_PATH, e);
+            return;
+        }
+    };
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Some((uid, gid)) = data_dir_owner {
-            let _ = std::os::unix::fs::chown(LOG_FILE_PATH, Some(uid), Some(gid));
+            let _ = std::os::unix::fs::fchown(&file, Some(uid), Some(gid));
         }
-        let _ = std::fs::set_permissions(LOG_FILE_PATH, std::fs::Permissions::from_mode(0o640));
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o640));
     }
 }
 
 /// Helper function to log Cashu redemption task messages to a dedicated file.
 /// If file logging fails, errors are logged to the nginx error log.
 ///
-/// `msg` is sanitised before writing: newline and carriage-return characters
-/// are stripped to prevent log-injection attacks.
+/// `msg` is sanitised before writing: all control characters are stripped to
+/// prevent log-injection attacks.
 pub fn log_redemption(msg: &str) {
-    // Strip characters that could be used for log injection:
-    // - CR/LF: inject new log lines
-    // - NUL: truncate log entries in some parsers
-    // - ESC (0x1b): ANSI escape sequences that corrupt terminal/log viewers
-    // - TAB: column-injection in tab-delimited log parsers
-    let sanitised: String = msg
-        .chars()
-        .filter(|&c| c != '\n' && c != '\r' && c != '\0' && c != '\x1b' && c != '\t')
-        .collect();
+    // Strip every control character rather than an explicit blocklist. Beyond
+    // the obvious CR/LF (forged log lines), NUL (entry truncation), ESC (ANSI
+    // sequences) and TAB (column injection), this also covers DEL, the rest of
+    // C0, and the C1 range — any of which can corrupt a log viewer or parser.
+    let sanitised: String = msg.chars().filter(|c| !c.is_control()).collect();
 
     match std::fs::OpenOptions::new()
         .create(true)
