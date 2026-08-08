@@ -6,6 +6,23 @@
 
 use ngx_l402_core::html_escape;
 
+/// Serialise a value as a JSON literal safe to inline in a `<script>` block.
+///
+/// `serde_json` alone is not enough here: it leaves `<` intact, so a value
+/// containing `</script>` would close the element early (XSS), and it emits
+/// U+2028/U+2029 raw, which are line terminators to pre-ES2019 parsers and
+/// break the script. Every inline-script interpolation goes through this so the
+/// escaping cannot drift between call sites.
+fn script_json_literal(s: &str) -> String {
+    serde_json::to_string(s)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 /// Render the full 402 payment page as an HTML string.
 ///
 /// # Arguments
@@ -136,11 +153,7 @@ pub fn render_payment_page(
     }}
     startPolling();
 "#,
-            mac = serde_json::to_string(macaroon_b64)
-                .unwrap_or_else(|_| "\"\"".to_string())
-                .replace('<', "\\u003c")
-                .replace('>', "\\u003e")
-                .replace('&', "\\u0026")
+            mac = script_json_literal(macaroon_b64)
         )
     } else {
         String::new()
@@ -382,16 +395,8 @@ document.getElementById('preimage-section').classList.remove('hidden')\">Enter p
         auto_detect_section = auto_detect_section,
         preimage_hidden_class = preimage_hidden_class,
         cashu_tab_html = cashu_tab_html,
-        invoice_json = serde_json::to_string(invoice)
-            .unwrap_or_else(|_| "\"\"".to_string())
-            .replace('<', "\\u003c")
-            .replace('>', "\\u003e")
-            .replace('&', "\\u0026"),
-        macaroon_json = serde_json::to_string(macaroon_b64)
-            .unwrap_or_else(|_| "\"\"".to_string())
-            .replace('<', "\\u003c")
-            .replace('>', "\\u003e")
-            .replace('&', "\\u0026"),
+        invoice_json = script_json_literal(invoice),
+        macaroon_json = script_json_literal(macaroon_b64),
         auto_detect_js = auto_detect_js,
     )
 }
