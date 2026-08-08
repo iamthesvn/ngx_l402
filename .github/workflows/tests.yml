@@ -2832,3 +2832,12 @@ jobs:
       contents: read
       packages: write
     uses: ./.github/workflows/ghcr-workflow.yml
+
+  publish-docs:
+    name: Publish documentation
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    secrets: inherit
+    uses: ./.github/workflows/docs.yml

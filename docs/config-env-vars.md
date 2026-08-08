@@ -314,9 +314,10 @@ location /library/full {
 
 Three things to know before using it:
 
-- **`l402_indefinite_access on` is effectively required.** The client presents the
-  same preimage on every path in the realm, and the single-use replay check would
-  reject the second request. Without it a realm token works exactly once.
+- **`l402_indefinite_access on` is required.** The client presents the same
+  preimage on every path in the realm, and the single-use replay check would
+  reject the second request. The module rejects the combination at config-parse
+  time, so nginx will not start without it.
 - **The realm is not bound to a price.** Two locations sharing a name with
   different `l402_amount_msat_default` means a token bought at the cheaper one
   opens the dearer one. Give differently-priced content different realm names.
@@ -326,6 +327,9 @@ Three things to know before using it:
 
 The HTTP method is still bound in realm mode: a `GET` token will not satisfy a
 `POST`.
+
+See [Realms](./realm.md) for the full treatment — inheritance, nested realms,
+and what stays bound.
 
 ### Example: auto-detect enabled location
 

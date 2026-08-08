@@ -1,11 +1,7 @@
 name: Deploy Documentation
 
-# Docs deploy on RELEASE, not on every merge to main: published documentation
-# should describe what users can install, not unreleased main-branch features.
-# For docs-only hotfixes between releases, use the manual workflow_dispatch.
 on:
-  release:
-    types: [published]
+  workflow_call:
   workflow_dispatch:
 
 permissions:
