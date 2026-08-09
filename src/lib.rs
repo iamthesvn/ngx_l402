@@ -1649,6 +1649,26 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Read the NUT-24 `X-Cashu` request header, if the client sent one.
+///
+/// Nginx only breaks out well-known headers as struct fields, so a custom one
+/// has to be found by walking `headers_in`.
+///
+/// # Safety
+/// `request` must be a valid, non-null request pointer for the duration of the
+/// call, as guaranteed by Nginx for access-phase handlers.
+unsafe fn cashu_token_header(request: *mut ngx_http_request_t) -> Option<String> {
+    let req = unsafe { Request::from_ngx_http_request(request) };
+    req.headers_in_iterator().find_map(|(name, value)| {
+        name.to_str()
+            .ok()
+            .filter(|n| n.eq_ignore_ascii_case("x-cashu"))
+            .and_then(|_| value.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
 /// # Safety
 /// This function is an Nginx access-phase handler registered via
 /// `postconfiguration`. Nginx guarantees that `request`, `request->connection`,
@@ -1690,7 +1710,11 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
                     .to_string(),
             )
         } else {
-            None
+            // NUT-24 sends the token in `X-Cashu`, not in Authorization, so a
+            // spec-compliant wallet retries the 402 with a header we would
+            // otherwise ignore and challenge again forever. Fold it into the
+            // same string the Cashu branch below already parses.
+            cashu_token_header(request).map(|token| format!("Cashu {}", token))
         };
 
         let uri = r.uri.to_string();
