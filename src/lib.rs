@@ -1883,6 +1883,21 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         _ => {}
     }
 
+    // RFC 9110 requires a 401 to carry a challenge, and every 401 the handler
+    // returns — bad macaroon, bad preimage, replay — had none, leaving clients
+    // with no stated way forward. Naming the scheme is a valid challenge and
+    // costs nothing; minting a fresh invoice for each failed credential is the
+    // expense `l402_invoice_rate_limit` exists to bound, so the client is told
+    // to retry unauthenticated for a full 402 challenge instead.
+    if result == 401 {
+        // SAFETY: `request` is non-null and valid for this handler's lifetime,
+        // as guaranteed by nginx before invoking the handler.
+        unsafe {
+            let req = Request::from_ngx_http_request(request);
+            req.add_header_out("WWW-Authenticate", "L402");
+        }
+    }
+
     // Only set L402 header if result is 402
     if result == 402 {
         if let Some((max_requests, window_secs)) = invoice_rate_limit {
