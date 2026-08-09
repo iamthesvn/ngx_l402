@@ -1529,6 +1529,22 @@ impl Merge for ModuleConfig {
             );
             return Err(MergeConfigError::NoValue);
         }
+        // NUT-24's `a` is a whole number of sats, so a sub-sat price is
+        // advertised rounded up while Lightning still charges it exactly. Not
+        // an error — the route works — but the two payment paths quietly
+        // disagree on price, which an operator should hear about once.
+        let cashu_on = std::env::var("CASHU_ECASH_SUPPORT")
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if self.enable && cashu_on && self.amount_msat % 1000 != 0 {
+            eprintln!(
+                "ngx_l402: price {} msat is not a whole number of sats; Cashu clients are \
+                 asked for {} sat while Lightning is charged {} msat.",
+                self.amount_msat,
+                (self.amount_msat + 999) / 1000,
+                self.amount_msat
+            );
+        }
         Ok(())
     }
 }
@@ -1647,6 +1663,30 @@ enum PaymentMethod {
 thread_local! {
     static LAST_PAYMENT_METHOD: std::cell::Cell<Option<PaymentMethod>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Map a Cashu verification error to a status code.
+///
+/// NUT-24 names 400 for a token from an unlisted mint or in the wrong unit. A
+/// malformed or replayed token is a bad credential, which is what the Lightning
+/// path answers 401 to — the same condition must not get a different code just
+/// because the payer used ecash.
+///
+/// Everything else is our failure, not the payer's, and must not come back as
+/// 4xx: the swap may already have consumed the token, and telling the payer it
+/// was invalid invites them to discard money that was spent. Unrecognised
+/// errors fall to 500 deliberately, for the same reason.
+fn cashu_failure_status(err: &str) -> isize {
+    const NUT24_BAD_REQUEST: [&str; 2] = ["not whitelisted", "Unsupported"];
+    const BAD_CREDENTIAL: [&str; 2] = ["Failed to decode Cashu token", "Cashu token already used"];
+
+    if NUT24_BAD_REQUEST.iter().any(|p| err.contains(p)) {
+        400
+    } else if BAD_CREDENTIAL.iter().any(|p| err.contains(p)) {
+        401
+    } else {
+        500
+    }
 }
 
 /// Read the NUT-24 `X-Cashu` request header, if the client sent one.
@@ -1878,7 +1918,10 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
                 None => {}
             }
         }
-        401 => metrics::inc(metrics::Metric::PaymentsInvalidTotal),
+        // 400 joins 401: a Cashu token rejected under NUT-24 is an invalid
+        // payment, same as a bad preimage. 500 stays out — that is our failure,
+        // not the payer's, and must not inflate the invalid-payment count.
+        400 | 401 => metrics::inc(metrics::Metric::PaymentsInvalidTotal),
         402 => metrics::inc(metrics::Metric::PaymentsMissingTotal),
         _ => {}
     }
@@ -2143,11 +2186,12 @@ pub fn l402_access_handler(
                 }
                 Ok(Ok(false)) => {
                     info!("⚠️ Cashu token verification failed");
-                    return 401;
+                    return 400;
                 }
                 Ok(Err(e)) => {
-                    error!("❌ Error verifying Cashu token: {:?}", e);
-                    return 401;
+                    let status = cashu_failure_status(&e);
+                    error!("❌ Error verifying Cashu token ({}): {:?}", status, e);
+                    return status;
                 }
                 Err(_) => {
                     error!("❌ Panic while verifying Cashu token; returning 500");
@@ -2750,7 +2794,7 @@ fn handle_dry_run_passthrough(
 
     match would_return {
         200 => metrics::inc(metrics::Metric::DryRunWouldAllowTotal),
-        401 | 402 => metrics::inc(metrics::Metric::DryRunWouldBlockTotal),
+        400..=402 => metrics::inc(metrics::Metric::DryRunWouldBlockTotal),
         _ => {}
     }
     if rate_limited {

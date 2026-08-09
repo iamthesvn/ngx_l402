@@ -970,10 +970,13 @@ pub fn generate_payment_request(
 
     // NUT-18/NUT-24 payment request format with NUT-10 P2PK requirement
     let payment_request = serde_json::json!({
-        "a": amount_msat / 1000, // Convert to sats
+        // Round up: verification compares msat, so advertising the floor of a
+        // sub-sat price would reject the very token the client was asked for.
+        "a": (amount_msat + 999) / 1000,
         "u": "sat",
         "m": mints_array,
-        "t": [], // Empty transport array = in-band transport (X-Cashu header)
+        // No transport field: NUT-24 omits it entirely because payment is
+        // in-band, in the X-Cashu header itself.
         "nut10": {
             "k": "P2PK",           // NUT-10 secret kind
             "d": public_key_str    // NUT-10 secret data - our public key!
@@ -1164,7 +1167,9 @@ pub async fn verify_cashu_token(
                 "❌ Cashu token receive failed from mint {}: {}",
                 mint_url, e
             );
-            Ok(false)
+            // Err, not Ok(false): the swap may already have consumed the token
+            // at the mint, so the caller must not answer "your token is bad".
+            Err(format!("mint receive failed: {}", e))
         }
     }
 }

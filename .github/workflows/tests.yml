@@ -1596,9 +1596,9 @@ jobs:
           response=$(curl -s -i -w "\n%{http_code}" --max-time 30 -L -H "Authorization: Cashu $INVALID_CASHU_TOKEN" http://0.0.0.0:8000/protected) || true
           status_code=$(echo "$response" | tail -n1); status_code=${status_code:-000}
           
-          # This should fail verification due to insufficient amount
-          if [ "$status_code" -ne 401 ]; then
-            echo "Error: Protected route with invalid Cashu token returned status $status_code, expected 401"
+          # NUT-24: an insufficient amount is answered with 400, not 401
+          if [ "$status_code" -ne 400 ]; then
+            echo "Error: Protected route with invalid Cashu token returned status $status_code, expected 400"
             echo "$response"
             docker logs nginx-lnd
             exit 1
@@ -1666,9 +1666,9 @@ jobs:
           response=$(curl -s -i -w "\n%{http_code}" --max-time 30 -L -H "Authorization: Cashu $ENCODED_NON_WHITELISTED_TOKEN" http://0.0.0.0:8000/protected) || true
           status_code=$(echo "$response" | tail -n1); status_code=${status_code:-000}
           
-          # This should fail verification due to non-whitelisted mint
-          if [ "$status_code" -ne 401 ]; then
-            echo "Error: Protected route with non-whitelisted Cashu token returned status $status_code, expected 401"
+          # NUT-24: a token from a mint outside the list is answered with 400
+          if [ "$status_code" -ne 400 ]; then
+            echo "Error: Protected route with non-whitelisted Cashu token returned status $status_code, expected 400"
             echo "$response"
             docker logs nginx-lnd
             exit 1
