@@ -4,6 +4,21 @@ The module supports [Cashu](https://cashu.space) eCash tokens as an alternative 
 
 ---
 
+## Paying with a Token
+
+Clients send the token in the `X-Cashu` header, per [NUT-24](https://github.com/cashubtc/nuts/blob/main/24.md):
+
+```bash
+curl -i https://your-gateway/protected -H "X-Cashu: cashuB..."
+```
+
+The token must come from a mint in `CASHU_WHITELISTED_MINTS` and cover the route's price.
+
+`Authorization: Cashu <token>` is also accepted and wins if both are sent. It predates
+NUT-24 support here; new clients should use `X-Cashu`.
+
+---
+
 ## Standard Mode vs P2PK Mode
 
 | | Standard Mode | P2PK Mode |
