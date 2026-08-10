@@ -1681,7 +1681,14 @@ thread_local! {
 /// was invalid invites them to discard money that was spent. Unrecognised
 /// errors fall to 500 deliberately, for the same reason.
 fn cashu_failure_status(err: &str) -> isize {
-    const NUT24_BAD_REQUEST: [&str; 2] = ["not whitelisted", "Unsupported"];
+    // Match the unit errors in full: a bare "Unsupported" also appears inside
+    // "Failed to decode Cashu token: Unsupported token", which is a malformed
+    // credential rather than a wrong denomination.
+    const NUT24_BAD_REQUEST: [&str; 3] = [
+        "not whitelisted",
+        "Unsupported token unit",
+        "Unsupported unit",
+    ];
     const BAD_CREDENTIAL: [&str; 2] = ["Failed to decode Cashu token", "Cashu token already used"];
 
     if NUT24_BAD_REQUEST.iter().any(|p| err.contains(p)) {
