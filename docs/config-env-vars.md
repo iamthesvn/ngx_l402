@@ -274,7 +274,7 @@ These are set inside `location {}` blocks in `nginx.conf` (not environment varia
 | Directive | Type | Default | Description |
 |---|---|---|---|
 | `l402` | boolean¹ | `off` | Enable L402 protection for this location |
-| `l402_amount_msat_default` | integer | — | Price in millisatoshis (overridden by Redis dynamic pricing) |
+| `l402_amount_msat_default` | integer | — | Price in millisatoshis (overridden by Redis dynamic pricing). Cashu payment requests carry a whole number of sats, so a sub-sat price is advertised rounded **up** while Lightning is charged exactly; the module warns at startup when the two diverge |
 | `l402_macaroon_timeout` | integer (seconds) | `0` (disabled) | Macaroon validity window; `0` = no expiry |
 | `l402_lnurl_addr` | string | — | Per-location LNURL address for multi-tenant setups |
 | `l402_invoice_rate_limit` | `<N>r/m` or `<N>r/s` | disabled | Max invoice generation rate per IP per route |

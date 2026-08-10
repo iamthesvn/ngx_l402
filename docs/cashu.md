@@ -38,13 +38,23 @@ Environment=CASHU_DB_PATH=/var/lib/nginx/cashu_tokens.db
 # BIP39 wallet mnemonic (NUT-13 backup phrase); unset = auto-generated on first run
 Environment=CASHU_WALLET_MNEMONIC="word1 word2 ... word12"
 
-# Optional: Whitelist specific mints (comma-separated)
+# Whitelist accepted mints (comma-separated). Optional, but see the note below.
 Environment=CASHU_WHITELISTED_MINTS=https://mint1.example.com,https://mint2.example.com
 
 # Optional: Auto-redeem to Lightning
 Environment=CASHU_REDEEM_ON_LIGHTNING=true
 Environment=CASHU_REDEMPTION_INTERVAL_SECS=3600
 ```
+
+Standard mode also answers a 402 with an `X-Cashu` payment request, stating the
+amount, unit and accepted mints. It carries no NUT-10 lock — that is what P2PK
+mode adds — but wallets need it to construct a payable token.
+
+> **Set `CASHU_WHITELISTED_MINTS`.** The mint list *is* the `m` field of the
+> payment request, so leaving it unset means there is nothing to advertise, no
+> challenge is sent, and NUT-24 wallets cannot pay at all — on any deployment.
+> Where callers are untrusted it does a second job: without it, someone can
+> present tokens from a mint they run themselves and pass the paywall for free.
 
 > **⚠️ Security**: `CASHU_WALLET_MNEMONIC` is the BIP39 phrase that derives the wallet seed (NUT-13) — the only backup of your wallet. Anyone with it can steal your tokens, and losing it loses the funds. It's a 12/24-word phrase (not a hex secret); leave it unset to auto-generate and persist one on first run, and never commit it to Git. On startup the module records a seed fingerprint next to the DB and refuses to start if a later mnemonic doesn't match — delete `wallet.fingerprint` to switch wallets intentionally.
 

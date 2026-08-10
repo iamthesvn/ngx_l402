@@ -154,9 +154,10 @@ fn payment_methods_block() -> Value {
         if !snap.cashu_mints.is_empty() {
             cashu.insert("mints".to_string(), json!(snap.cashu_mints));
         }
+        // Both modes challenge in X-Cashu; only P2PK adds a lock to it.
+        cashu.insert("challenge_header".to_string(), json!("X-Cashu"));
         if snap.cashu_p2pk {
             cashu.insert("p2pk_supported".to_string(), json!(true));
-            cashu.insert("challenge_header".to_string(), json!("X-Cashu"));
         }
         methods.push(Value::Object(cashu));
     }

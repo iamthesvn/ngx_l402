@@ -1555,6 +1555,25 @@ jobs:
 
           sleep 5
           
+          # Standard mode must advertise the NUT-24 challenge too, not just P2PK.
+          # cashu.me reads X-Cashu off the 402 and throws without it, so a
+          # missing header means no browser wallet can pay this gateway.
+          echo "Checking X-Cashu header on 402 response (standard mode)..."
+          std_resp=$(curl -s -i --max-time 30 http://0.0.0.0:8000/protected) || true
+          std_code=$(echo "$std_resp" | grep "^HTTP" | tail -1 | awk '{print $2}'); std_code=${std_code:-000}
+          if [ "$std_code" -ne 402 ]; then
+            echo "❌ Expected 402, got $std_code"
+            docker logs nginx-lnd | tail -30
+            exit 1
+          fi
+          if ! echo "$std_resp" | grep -qi "^X-Cashu:"; then
+            echo "❌ X-Cashu header missing from 402 response in standard mode"
+            echo "$std_resp"
+            docker logs nginx-lnd | tail -30
+            exit 1
+          fi
+          echo "✅ X-Cashu NUT-24 payment request present on 402 in standard mode"
+
           # Test protected route with Cashu token
           echo "Testing protected route with Cashu token..."
           max_retries=3

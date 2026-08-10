@@ -962,14 +962,9 @@ pub fn generate_payment_request(
     amount_msat: i64,
     whitelisted_mints: &HashSet<String>,
 ) -> Result<String, String> {
-    let public_key_str = P2PK_PUBLIC_KEY
-        .get()
-        .ok_or("P2PK public key not initialized")?;
-
     let mints_array: Vec<String> = whitelisted_mints.iter().cloned().collect();
 
-    // NUT-18/NUT-24 payment request format with NUT-10 P2PK requirement
-    let payment_request = serde_json::json!({
+    let mut payment_request = serde_json::json!({
         // Round up: verification compares msat, so advertising the floor of a
         // sub-sat price would reject the very token the client was asked for.
         "a": (amount_msat + 999) / 1000,
@@ -977,16 +972,25 @@ pub fn generate_payment_request(
         "m": mints_array,
         // No transport field: NUT-24 omits it entirely because payment is
         // in-band, in the X-Cashu header itself.
-        "nut10": {
-            "k": "P2PK",           // NUT-10 secret kind
-            "d": public_key_str    // NUT-10 secret data - our public key!
-        }
     });
 
-    info!(
-        "📤 NUT-18 payment request generated with P2PK pubkey: {}",
-        public_key_str
-    );
+    // `nut10` states the lock a token must carry, and NUT-24 marks it optional.
+    // Standard mode has no key to lock to, so the field is left out rather than
+    // sent empty — a client reading it would otherwise be told to lock to
+    // nothing and produce a token we cannot accept.
+    match P2PK_PUBLIC_KEY.get() {
+        Some(public_key_str) => {
+            payment_request["nut10"] = serde_json::json!({
+                "k": "P2PK",           // NUT-10 secret kind
+                "d": public_key_str    // NUT-10 secret data - our public key!
+            });
+            info!(
+                "📤 NUT-24 payment request generated with P2PK pubkey: {}",
+                public_key_str
+            );
+        }
+        None => info!("📤 NUT-24 payment request generated (standard mode, no lock required)"),
+    }
     debug!("📋 Payment request: {:?}", payment_request);
 
     // Encode as NUT-18 format: "creq" + "A" + base64_urlsafe(CBOR(PaymentRequest))

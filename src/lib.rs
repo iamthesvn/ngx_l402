@@ -1104,17 +1104,21 @@ impl L402Module {
     }
 
     pub fn get_cashu_payment_request(&self, amount_msat: i64) -> Option<String> {
-        // Check if P2PK mode is enabled (use initialized state, not env vars)
-        if !cashu::is_p2pk_mode_enabled() {
+        // Not gated on P2PK: a standard-mode gateway accepts NUT-24 tokens, and
+        // without this challenge a wallet has no way to learn the amount, unit
+        // or accepted mints. cashu.me fails outright on a 402 with no X-Cashu.
+        if !cashu::is_cashu_ecash_enabled() {
             return None;
         }
 
-        // Get whitelisted mints
+        // NUT-24's `m` names the mints a token may come from. With no whitelist
+        // there is nothing to advertise, and the request would send the client
+        // to any mint at all — which verification then rejects.
         if let Some(whitelisted_mints) = cashu::get_whitelisted_mints() {
             match cashu::generate_payment_request(amount_msat, whitelisted_mints) {
                 Ok(req) => {
                     info!(
-                        "✅ Generated X-Cashu payment request (P2PK): {}",
+                        "✅ Generated X-Cashu payment request: {}",
                         &req[..50.min(req.len())]
                     );
                     Some(req)
@@ -1125,7 +1129,7 @@ impl L402Module {
                 }
             }
         } else {
-            error!("❌ No whitelisted mints configured for P2PK mode");
+            error!("❌ No whitelisted mints configured; cannot advertise a Cashu challenge");
             None
         }
     }
@@ -1981,12 +1985,16 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
             p2pk_mode
         );
 
-        // If P2PK mode is enabled, send X-Cashu header (NUT-24)
-        if cashu_ecash_support && p2pk_mode {
+        // Advertise the NUT-24 challenge whenever Cashu is accepted, not only in
+        // P2PK mode. The request differs between the two — P2PK adds a `nut10`
+        // lock — but a standard-mode gateway still has to state the amount, unit
+        // and mints, or a NUT-24 wallet cannot construct a payable token.
+        if cashu_ecash_support {
             ngx_log_error!(
                 NGX_LOG_INFO,
                 log_ref,
-                "P2PK mode enabled - generating X-Cashu header (NUT-24)"
+                "Generating X-Cashu header (NUT-24, p2pk={})",
+                p2pk_mode
             );
 
             if let Some(cashu_payment_request) = module.get_cashu_payment_request(final_amount) {
@@ -2011,9 +2019,8 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
             ngx_log_error!(
                 NGX_LOG_INFO,
                 log_ref,
-                "X-Cashu header not sent (cashu={} p2pk={})",
-                cashu_ecash_support,
-                p2pk_mode
+                "X-Cashu header not sent (cashu={})",
+                cashu_ecash_support
             );
         }
 
