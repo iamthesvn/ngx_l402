@@ -1092,7 +1092,7 @@ impl L402Module {
         token: &str,
         amount_msat: i64,
         lnurl_addr: Option<String>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, cashu::CashuError> {
         // Check if P2PK mode is enabled (use initialized state, not env vars)
         if cashu::is_p2pk_mode_enabled() {
             info!("🔐 Using P2PK local verification mode");
@@ -1669,37 +1669,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Map a Cashu verification error to a status code.
-///
-/// NUT-24 names 400 for a token from an unlisted mint or in the wrong unit. A
-/// malformed or replayed token is a bad credential, which is what the Lightning
-/// path answers 401 to — the same condition must not get a different code just
-/// because the payer used ecash.
-///
-/// Everything else is our failure, not the payer's, and must not come back as
-/// 4xx: the swap may already have consumed the token, and telling the payer it
-/// was invalid invites them to discard money that was spent. Unrecognised
-/// errors fall to 500 deliberately, for the same reason.
-fn cashu_failure_status(err: &str) -> isize {
-    // Match the unit errors in full: a bare "Unsupported" also appears inside
-    // "Failed to decode Cashu token: Unsupported token", which is a malformed
-    // credential rather than a wrong denomination.
-    const NUT24_BAD_REQUEST: [&str; 3] = [
-        "not whitelisted",
-        "Unsupported token unit",
-        "Unsupported unit",
-    ];
-    const BAD_CREDENTIAL: [&str; 2] = ["Failed to decode Cashu token", "Cashu token already used"];
-
-    if NUT24_BAD_REQUEST.iter().any(|p| err.contains(p)) {
-        400
-    } else if BAD_CREDENTIAL.iter().any(|p| err.contains(p)) {
-        401
-    } else {
-        500
-    }
-}
-
 /// Read the NUT-24 `X-Cashu` request header, if the client sent one.
 ///
 /// Nginx only breaks out well-known headers as struct fields, so a custom one
@@ -2203,8 +2172,8 @@ pub fn l402_access_handler(
                     return 400;
                 }
                 Ok(Err(e)) => {
-                    let status = cashu_failure_status(&e);
-                    error!("❌ Error verifying Cashu token ({}): {:?}", status, e);
+                    let status = e.http_status();
+                    error!("❌ Error verifying Cashu token ({}): {}", status, e);
                     return status;
                 }
                 Err(_) => {
@@ -2274,11 +2243,13 @@ pub fn l402_access_handler(
                                 return 500;
                             }
                             Err(_) => {
-                                warn!(
-                                "Auto-detect invoice lookup timed out after {}s — returning 402",
-                                AUTODETECT_LOOKUP_TIMEOUT.as_secs()
-                            );
-                                return 402;
+                                // A timeout means settlement is unknown, not
+                                // that it did not happen.
+                                error!(
+                                    "Invoice lookup timed out after {}s",
+                                    AUTODETECT_LOOKUP_TIMEOUT.as_secs()
+                                );
+                                return 500;
                             }
                         }
                     };

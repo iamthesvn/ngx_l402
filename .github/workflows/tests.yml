@@ -1867,8 +1867,9 @@ jobs:
           plain_resp=$(curl -s -w "\n%{http_code}" --max-time 30 \
             -H "Authorization: Cashu $PLAIN_TOKEN" http://0.0.0.0:8000/protected) || true
           plain_code=$(echo "$plain_resp" | tail -n1); plain_code=${plain_code:-000}
-          if [ "$plain_code" -ne 401 ]; then
-            echo "❌ Plain token accepted in P2PK mode (got $plain_code), expected 401"
+          # NUT-24 lists "insufficient locking conditions" among its 400 cases
+          if [ "$plain_code" -ne 400 ]; then
+            echo "❌ Plain token accepted in P2PK mode (got $plain_code), expected 400"
             docker logs nginx-lnd | tail -30
             exit 1
           fi
