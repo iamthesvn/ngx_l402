@@ -1020,7 +1020,7 @@ pub async fn verify_cashu_token(
     token: &str,
     amount_msat: i64,
     lnurl_addr: Option<String>,
-) -> Result<bool, CashuError> {
+) -> Result<(), CashuError> {
     // Log database status
     debug!("🔍 Verifying Cashu token, checking database connection...");
 
@@ -1089,11 +1089,10 @@ pub async fn verify_cashu_token(
 
     // Check if the token amount is sufficient
     if total_amount_msat < amount_msat as u64 {
-        warn!(
-            "⚠️ Cashu token amount insufficient: {} msat (required: {} msat)",
+        return Err(CashuError::Unacceptable(format!(
+            "Cashu token amount insufficient: {} msat (required: {} msat)",
             total_amount_msat, amount_msat
-        );
-        return Ok(false);
+        )));
     }
 
     info!(
@@ -1114,8 +1113,10 @@ pub async fn verify_cashu_token(
 
     // Check if the mint is whitelisted
     if !is_mint_whitelisted(&mint_url) {
-        info!("⚠️ Cashu token from non-whitelisted mint: {}", mint_url);
-        return Ok(false);
+        return Err(CashuError::Unacceptable(format!(
+            "Mint {} not whitelisted",
+            mint_url
+        )));
     }
 
     info!("✅ Cashu token from whitelisted mint: {}", mint_url);
@@ -1172,11 +1173,14 @@ pub async fn verify_cashu_token(
             match crate::store_cashu_token_as_used(token) {
                 Ok(true) => {
                     cache_processed_token(token);
-                    Ok(true)
+                    Ok(())
                 }
                 Ok(false) => {
-                    warn!("🚨 Concurrent Cashu replay detected: token already claimed");
-                    Ok(false)
+                    // Same offence as the cache hit above, so the same answer:
+                    // losing the claim race must not depend on timing.
+                    Err(CashuError::BadCredential(
+                        "Cashu token already used".to_string(),
+                    ))
                 }
                 Err(e) => {
                     warn!(
@@ -1184,7 +1188,7 @@ pub async fn verify_cashu_token(
                         e
                     );
                     cache_processed_token(token);
-                    Ok(true)
+                    Ok(())
                 }
             }
         }
@@ -1206,7 +1210,7 @@ pub async fn verify_cashu_token_p2pk(
     token: &str,
     amount_msat: i64,
     lnurl_addr: Option<String>,
-) -> Result<bool, CashuError> {
+) -> Result<(), CashuError> {
     info!("🔐 P2PK mode: Optimized token verification");
 
     // Check thread-local memory cache first (fastest path — no I/O)
@@ -1495,8 +1499,9 @@ pub async fn verify_cashu_token_p2pk(
     // same proofs are rejected by the same atomic SET NX EX slot.
     let claimed = match crate::store_cashu_token_as_used(&proof_replay_key) {
         Ok(false) => {
-            warn!("🚨 Concurrent Cashu replay detected: proof set already claimed");
-            return Ok(false);
+            return Err(CashuError::BadCredential(
+                "Cashu token already used".to_string(),
+            ));
         }
         Ok(true) => true, // won the race — proceed to persist proofs
         Err(crate::ReplayClaimError::NotConfigured) => {
@@ -1555,7 +1560,7 @@ pub async fn verify_cashu_token_p2pk(
         "✅ ACCEPTED ({} msat stored in CDK database)",
         total_amount_msat
     );
-    Ok(true)
+    Ok(())
 }
 
 pub async fn redeem_to_lightning() -> Result<bool, String> {

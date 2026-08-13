@@ -1092,7 +1092,7 @@ impl L402Module {
         token: &str,
         amount_msat: i64,
         lnurl_addr: Option<String>,
-    ) -> Result<bool, cashu::CashuError> {
+    ) -> Result<(), cashu::CashuError> {
         // Check if P2PK mode is enabled (use initialized state, not env vars)
         if cashu::is_p2pk_mode_enabled() {
             info!("🔐 Using P2PK local verification mode");
@@ -2163,13 +2163,9 @@ pub fn l402_access_handler(
             }));
 
             match verify_result {
-                Ok(Ok(true)) => {
+                Ok(Ok(())) => {
                     LAST_PAYMENT_METHOD.with(|m| m.set(Some(PaymentMethod::Cashu)));
                     return NGX_DECLINED as isize;
-                }
-                Ok(Ok(false)) => {
-                    info!("⚠️ Cashu token verification failed");
-                    return 400;
                 }
                 Ok(Err(e)) => {
                     let status = e.http_status();
