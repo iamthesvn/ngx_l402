@@ -1555,6 +1555,25 @@ jobs:
 
           sleep 5
           
+          # Standard mode must advertise the NUT-24 challenge too, not just P2PK.
+          # cashu.me reads X-Cashu off the 402 and throws without it, so a
+          # missing header means no browser wallet can pay this gateway.
+          echo "Checking X-Cashu header on 402 response (standard mode)..."
+          std_resp=$(curl -s -i --max-time 30 http://0.0.0.0:8000/protected) || true
+          std_code=$(echo "$std_resp" | grep "^HTTP" | tail -1 | awk '{print $2}'); std_code=${std_code:-000}
+          if [ "$std_code" -ne 402 ]; then
+            echo "❌ Expected 402, got $std_code"
+            docker logs nginx-lnd | tail -30
+            exit 1
+          fi
+          if ! echo "$std_resp" | grep -qi "^X-Cashu:"; then
+            echo "❌ X-Cashu header missing from 402 response in standard mode"
+            echo "$std_resp"
+            docker logs nginx-lnd | tail -30
+            exit 1
+          fi
+          echo "✅ X-Cashu NUT-24 payment request present on 402 in standard mode"
+
           # Test protected route with Cashu token
           echo "Testing protected route with Cashu token..."
           max_retries=3
@@ -1596,9 +1615,9 @@ jobs:
           response=$(curl -s -i -w "\n%{http_code}" --max-time 30 -L -H "Authorization: Cashu $INVALID_CASHU_TOKEN" http://0.0.0.0:8000/protected) || true
           status_code=$(echo "$response" | tail -n1); status_code=${status_code:-000}
           
-          # This should fail verification due to insufficient amount
-          if [ "$status_code" -ne 401 ]; then
-            echo "Error: Protected route with invalid Cashu token returned status $status_code, expected 401"
+          # NUT-24: an insufficient amount is answered with 400, not 401
+          if [ "$status_code" -ne 400 ]; then
+            echo "Error: Protected route with invalid Cashu token returned status $status_code, expected 400"
             echo "$response"
             docker logs nginx-lnd
             exit 1
@@ -1666,7 +1685,8 @@ jobs:
           response=$(curl -s -i -w "\n%{http_code}" --max-time 30 -L -H "Authorization: Cashu $ENCODED_NON_WHITELISTED_TOKEN" http://0.0.0.0:8000/protected) || true
           status_code=$(echo "$response" | tail -n1); status_code=${status_code:-000}
           
-          # This should fail verification due to non-whitelisted mint
+          # 401, not the 400 a real unlisted mint would give: this fixture is
+          # hand-built JSON that fails to decode before the whitelist check runs.
           if [ "$status_code" -ne 401 ]; then
             echo "Error: Protected route with non-whitelisted Cashu token returned status $status_code, expected 401"
             echo "$response"
@@ -1848,8 +1868,9 @@ jobs:
           plain_resp=$(curl -s -w "\n%{http_code}" --max-time 30 \
             -H "Authorization: Cashu $PLAIN_TOKEN" http://0.0.0.0:8000/protected) || true
           plain_code=$(echo "$plain_resp" | tail -n1); plain_code=${plain_code:-000}
-          if [ "$plain_code" -ne 401 ]; then
-            echo "❌ Plain token accepted in P2PK mode (got $plain_code), expected 401"
+          # NUT-24 lists "insufficient locking conditions" among its 400 cases
+          if [ "$plain_code" -ne 400 ]; then
+            echo "❌ Plain token accepted in P2PK mode (got $plain_code), expected 400"
             docker logs nginx-lnd | tail -30
             exit 1
           fi

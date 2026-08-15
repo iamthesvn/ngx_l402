@@ -124,6 +124,10 @@ async fn get_db() -> Result<Arc<cdk_sqlite::WalletSqliteDatabase>, String> {
         .cloned()
 }
 
+// Lives in ngx_l402_core so the status mapping has runnable tests: this crate
+// is a cdylib and its own #[test] blocks cannot link against nginx.
+pub use ngx_l402_core::CashuError;
+
 // Whitelisted mints singleton
 static WHITELISTED_MINTS: OnceLock<HashSet<String>> = OnceLock::new();
 
@@ -962,28 +966,35 @@ pub fn generate_payment_request(
     amount_msat: i64,
     whitelisted_mints: &HashSet<String>,
 ) -> Result<String, String> {
-    let public_key_str = P2PK_PUBLIC_KEY
-        .get()
-        .ok_or("P2PK public key not initialized")?;
-
     let mints_array: Vec<String> = whitelisted_mints.iter().cloned().collect();
 
-    // NUT-18/NUT-24 payment request format with NUT-10 P2PK requirement
-    let payment_request = serde_json::json!({
-        "a": amount_msat / 1000, // Convert to sats
+    let mut payment_request = serde_json::json!({
+        // Round up: verification compares msat, so advertising the floor of a
+        // sub-sat price would reject the very token the client was asked for.
+        "a": (amount_msat + 999) / 1000,
         "u": "sat",
         "m": mints_array,
-        "t": [], // Empty transport array = in-band transport (X-Cashu header)
-        "nut10": {
-            "k": "P2PK",           // NUT-10 secret kind
-            "d": public_key_str    // NUT-10 secret data - our public key!
-        }
+        // No transport field: NUT-24 omits it entirely because payment is
+        // in-band, in the X-Cashu header itself.
     });
 
-    info!(
-        "📤 NUT-18 payment request generated with P2PK pubkey: {}",
-        public_key_str
-    );
+    // `nut10` states the lock a token must carry, and NUT-24 marks it optional.
+    // Standard mode has no key to lock to, so the field is left out rather than
+    // sent empty — a client reading it would otherwise be told to lock to
+    // nothing and produce a token we cannot accept.
+    match P2PK_PUBLIC_KEY.get() {
+        Some(public_key_str) => {
+            payment_request["nut10"] = serde_json::json!({
+                "k": "P2PK",           // NUT-10 secret kind
+                "d": public_key_str    // NUT-10 secret data - our public key!
+            });
+            info!(
+                "📤 NUT-24 payment request generated with P2PK pubkey: {}",
+                public_key_str
+            );
+        }
+        None => info!("📤 NUT-24 payment request generated (standard mode, no lock required)"),
+    }
     debug!("📋 Payment request: {:?}", payment_request);
 
     // Encode as NUT-18 format: "creq" + "A" + base64_urlsafe(CBOR(PaymentRequest))
@@ -1009,7 +1020,7 @@ pub async fn verify_cashu_token(
     token: &str,
     amount_msat: i64,
     lnurl_addr: Option<String>,
-) -> Result<bool, String> {
+) -> Result<(), CashuError> {
     // Log database status
     debug!("🔍 Verifying Cashu token, checking database connection...");
 
@@ -1024,13 +1035,17 @@ pub async fn verify_cashu_token(
 
     if token_already_processed {
         warn!("🚨 Replay attack detected: Cashu token already used (memory cache)");
-        return Err("Cashu token already used".to_string());
+        return Err(CashuError::BadCredential(
+            "Cashu token already used".to_string(),
+        ));
     }
 
     // Check Redis for replay (read-only check — store happens after successful verification)
     if crate::is_cashu_token_used(token) {
         error!("🚨 Replay attack detected: Cashu token already used (Redis)");
-        return Err("Cashu token already used".to_string());
+        return Err(CashuError::BadCredential(
+            "Cashu token already used".to_string(),
+        ));
     }
 
     // Decode the token from string
@@ -1038,37 +1053,46 @@ pub async fn verify_cashu_token(
         Ok(token) => token,
         Err(e) => {
             error!("❌ Failed to decode Cashu token: {}", e);
-            return Err(format!("Failed to decode Cashu token: {}", e));
+            return Err(CashuError::BadCredential(format!(
+                "Failed to decode Cashu token: {}",
+                e
+            )));
         }
     };
 
     // Calculate total token amount in millisatoshis
     let total_amount = token_decoded
         .value()
-        .map_err(|e| format!("Failed to get token value: {}", e))?;
+        .map_err(|e| CashuError::BadCredential(format!("Failed to get token value: {}", e)))?;
 
     // Check if the token unit is in millisatoshis or satoshis
     let unit = token_decoded
         .unit()
-        .ok_or_else(|| "Token has no currency unit".to_string())?;
+        .ok_or_else(|| CashuError::Unacceptable("Token has no currency unit".to_string()))?;
     let total_amount_msat: u64 = if unit == cdk::nuts::CurrencyUnit::Sat {
         u64::from(total_amount)
             .checked_mul(MSAT_PER_SAT)
-            .ok_or_else(|| "Token amount overflows u64 sat→msat conversion".to_string())?
+            .ok_or_else(|| {
+                CashuError::BadCredential(
+                    "Token amount overflows u64 sat→msat conversion".to_string(),
+                )
+            })?
     } else if unit == cdk::nuts::CurrencyUnit::Msat {
         u64::from(total_amount)
     } else {
         // Other units not supported
-        return Err(format!("Unsupported token unit: {:?}", unit));
+        return Err(CashuError::Unacceptable(format!(
+            "Unsupported token unit: {:?}",
+            unit
+        )));
     };
 
     // Check if the token amount is sufficient
     if total_amount_msat < amount_msat as u64 {
-        warn!(
-            "⚠️ Cashu token amount insufficient: {} msat (required: {} msat)",
+        return Err(CashuError::Unacceptable(format!(
+            "Cashu token amount insufficient: {} msat (required: {} msat)",
             total_amount_msat, amount_msat
-        );
-        return Ok(false);
+        )));
     }
 
     info!(
@@ -1083,21 +1107,25 @@ pub async fn verify_cashu_token(
     let mint_url = normalize_mint_url(
         &token_decoded
             .mint_url()
-            .map_err(|e| format!("Failed to get mint URL: {}", e))?
+            .map_err(|e| CashuError::BadCredential(format!("Failed to get mint URL: {}", e)))?
             .to_string(),
     );
 
     // Check if the mint is whitelisted
     if !is_mint_whitelisted(&mint_url) {
-        info!("⚠️ Cashu token from non-whitelisted mint: {}", mint_url);
-        return Ok(false);
+        return Err(CashuError::Unacceptable(format!(
+            "Mint {} not whitelisted",
+            mint_url
+        )));
     }
 
     info!("✅ Cashu token from whitelisted mint: {}", mint_url);
 
     // Reuse a cached wallet for this (mint, unit). Avoids per-request construction
     // and keeps the keysets cache warm.
-    let wallet = get_or_create_wallet(&mint_url, unit).await?;
+    let wallet = get_or_create_wallet(&mint_url, unit)
+        .await
+        .map_err(CashuError::Internal)?;
 
     match wallet
         .receive(token, cdk::wallet::ReceiveOptions::default())
@@ -1114,10 +1142,12 @@ pub async fn verify_cashu_token(
                 // proofs. The wallet is shared across tenants, so
                 // get_unspent_proofs() would return other tenants' proofs and
                 // overwrite their LNURL mappings.
-                let keysets_info = wallet
-                    .get_mint_keysets()
-                    .await
-                    .map_err(|e| format!("Failed to get keysets for proof extraction: {}", e))?;
+                let keysets_info = wallet.get_mint_keysets().await.map_err(|e| {
+                    CashuError::Internal(format!(
+                        "Failed to get keysets for proof extraction: {}",
+                        e
+                    ))
+                })?;
                 match token_decoded.proofs(&keysets_info) {
                     Ok(proofs) => {
                         if let Err(e) = set_proof_to_lnurl(proofs, lnurl_addr) {
@@ -1143,11 +1173,14 @@ pub async fn verify_cashu_token(
             match crate::store_cashu_token_as_used(token) {
                 Ok(true) => {
                     cache_processed_token(token);
-                    Ok(true)
+                    Ok(())
                 }
                 Ok(false) => {
-                    warn!("🚨 Concurrent Cashu replay detected: token already claimed");
-                    Ok(false)
+                    // Same offence as the cache hit above, so the same answer:
+                    // losing the claim race must not depend on timing.
+                    Err(CashuError::BadCredential(
+                        "Cashu token already used".to_string(),
+                    ))
                 }
                 Err(e) => {
                     warn!(
@@ -1155,7 +1188,7 @@ pub async fn verify_cashu_token(
                         e
                     );
                     cache_processed_token(token);
-                    Ok(true)
+                    Ok(())
                 }
             }
         }
@@ -1164,7 +1197,9 @@ pub async fn verify_cashu_token(
                 "❌ Cashu token receive failed from mint {}: {}",
                 mint_url, e
             );
-            Ok(false)
+            // Internal, not a payer fault: the swap may already have consumed
+            // the token at the mint, so the answer must not be "yours was bad".
+            Err(CashuError::Internal(format!("mint receive failed: {}", e)))
         }
     }
 }
@@ -1175,7 +1210,7 @@ pub async fn verify_cashu_token_p2pk(
     token: &str,
     amount_msat: i64,
     lnurl_addr: Option<String>,
-) -> Result<bool, String> {
+) -> Result<(), CashuError> {
     info!("🔐 P2PK mode: Optimized token verification");
 
     // Check thread-local memory cache first (fastest path — no I/O)
@@ -1188,18 +1223,22 @@ pub async fn verify_cashu_token_p2pk(
 
     if token_seen {
         warn!("🚨 Replay attack detected: Cashu token already used (memory cache)");
-        return Err("Cashu token already used".to_string());
+        return Err(CashuError::BadCredential(
+            "Cashu token already used".to_string(),
+        ));
     }
 
     // Check Redis for replay (read-only — store happens after successful verification)
     if crate::is_cashu_token_used(token) {
         error!("🚨 Replay attack detected: Cashu token already used (Redis)");
-        return Err("Cashu token already used".to_string());
+        return Err(CashuError::BadCredential(
+            "Cashu token already used".to_string(),
+        ));
     }
 
     // Decode and validate token
-    let token_decoded =
-        cdk::nuts::Token::from_str(token).map_err(|e| format!("Failed to decode token: {}", e))?;
+    let token_decoded = cdk::nuts::Token::from_str(token)
+        .map_err(|e| CashuError::BadCredential(format!("Failed to decode token: {}", e)))?;
 
     // Extract and normalize the mint URL from the token immediately so that any
     // extra trailing slash or whitespace in the token metadata is stripped before
@@ -1207,43 +1246,56 @@ pub async fn verify_cashu_token_p2pk(
     let mint_url_str = normalize_mint_url(
         &token_decoded
             .mint_url()
-            .map_err(|e| format!("Failed to get mint URL: {}", e))?
+            .map_err(|e| CashuError::BadCredential(format!("Failed to get mint URL: {}", e)))?
             .to_string(),
     );
     // Re-parse to a typed MintUrl (needed for ProofInfo and wallet APIs)
-    let mint_url = MintUrl::from_str(&mint_url_str)
-        .map_err(|e| format!("Invalid mint URL after normalization: {:?}", e))?;
+    let mint_url = MintUrl::from_str(&mint_url_str).map_err(|e| {
+        CashuError::Unacceptable(format!("Invalid mint URL after normalization: {:?}", e))
+    })?;
 
     // Verify mint is whitelisted
-    let whitelisted_mints = get_whitelisted_mints().ok_or("No whitelisted mints configured")?;
+    let whitelisted_mints = get_whitelisted_mints().ok_or(CashuError::Internal(
+        "No whitelisted mints configured".to_string(),
+    ))?;
 
     if !whitelisted_mints.contains(&mint_url_str) {
-        return Err(format!("Mint {} not whitelisted", mint_url_str));
+        return Err(CashuError::Unacceptable(format!(
+            "Mint {} not whitelisted",
+            mint_url_str
+        )));
     }
 
     // Verify amount
     let total_amount = token_decoded
         .value()
-        .map_err(|e| format!("Failed to get value: {}", e))?;
+        .map_err(|e| CashuError::BadCredential(format!("Failed to get value: {}", e)))?;
 
     let unit = token_decoded
         .unit()
-        .ok_or_else(|| "Token has no currency unit".to_string())?;
+        .ok_or_else(|| CashuError::Unacceptable("Token has no currency unit".to_string()))?;
     let total_amount_msat: u64 = if unit == cdk::nuts::CurrencyUnit::Sat {
         u64::from(total_amount)
             .checked_mul(MSAT_PER_SAT)
-            .ok_or_else(|| "Token amount overflows u64 sat→msat conversion".to_string())?
+            .ok_or_else(|| {
+                CashuError::BadCredential(
+                    "Token amount overflows u64 sat→msat conversion".to_string(),
+                )
+            })?
     } else if unit == cdk::nuts::CurrencyUnit::Msat {
         u64::from(total_amount)
     } else {
-        return Err(format!("Unsupported unit: {:?}", unit));
+        return Err(CashuError::Unacceptable(format!(
+            "Unsupported unit: {:?}",
+            unit
+        )));
     };
 
     if total_amount_msat < amount_msat as u64 {
-        return Err(format!(
+        return Err(CashuError::Unacceptable(format!(
             "Insufficient amount: {} < {}",
             total_amount_msat, amount_msat
-        ));
+        )));
     }
 
     info!(
@@ -1253,7 +1305,9 @@ pub async fn verify_cashu_token_p2pk(
 
     // Reuse a cached wallet for this (mint, unit). Same instance used by the
     // non-P2PK path; keysets cache is shared.
-    let wallet = get_or_create_wallet(&mint_url_str, unit.clone()).await?;
+    let wallet = get_or_create_wallet(&mint_url_str, unit.clone())
+        .await
+        .map_err(CashuError::Internal)?;
 
     // Get keysets (use cached if available, fetch once if not)
     let keysets_info = match wallet.get_mint_keysets().await {
@@ -1266,14 +1320,14 @@ pub async fn verify_cashu_token_p2pk(
             wallet
                 .load_mint_keysets()
                 .await
-                .map_err(|e| format!("Failed to load keysets: {}", e))?
+                .map_err(|e| CashuError::Internal(format!("Failed to load keysets: {}", e)))?
         }
     };
 
     // Extract proofs using keysets
     let proofs = token_decoded
         .proofs(&keysets_info)
-        .map_err(|e| format!("Failed to extract proofs: {}", e))?;
+        .map_err(|e| CashuError::BadCredential(format!("Failed to extract proofs: {}", e)))?;
 
     // Compute a canonical replay key from sorted proof Y-values so that
     // re-encoding the same proofs into a different token string cannot bypass
@@ -1286,11 +1340,14 @@ pub async fn verify_cashu_token_p2pk(
         let mut y_values: Vec<String> = proofs
             .iter()
             .map(|p| {
-                p.y()
-                    .map(|y| y.to_hex())
-                    .map_err(|e| format!("Failed to compute proof Y-value for replay key: {:?}", e))
+                p.y().map(|y| y.to_hex()).map_err(|e| {
+                    CashuError::Internal(format!(
+                        "Failed to compute proof Y-value for replay key: {:?}",
+                        e
+                    ))
+                })
             })
-            .collect::<Result<Vec<String>, String>>()?;
+            .collect::<Result<Vec<String>, CashuError>>()?;
         y_values.sort_unstable();
         let mut hasher = Sha256::new();
         hasher.update(y_values.join(",").as_bytes());
@@ -1301,17 +1358,19 @@ pub async fn verify_cashu_token_p2pk(
     // re-submitted under a different token serialization.
     if crate::is_cashu_token_used(&proof_replay_key) {
         error!("🚨 Replay attack detected: proof set already used (proof-key check)");
-        return Err("Cashu token already used".to_string());
+        return Err(CashuError::BadCredential(
+            "Cashu token already used".to_string(),
+        ));
     }
 
     // Get our public key for P2PK verification (the private key is not needed
     // on the verify path — only for signing during melt/redemption).
-    let public_key_str = P2PK_PUBLIC_KEY
-        .get()
-        .ok_or("P2PK public key not initialized")?;
+    let public_key_str = P2PK_PUBLIC_KEY.get().ok_or(CashuError::Internal(
+        "P2PK public key not initialized".to_string(),
+    ))?;
 
     let public_key = cdk::nuts::PublicKey::from_hex(public_key_str)
-        .map_err(|e| format!("Failed to parse public key: {:?}", e))?;
+        .map_err(|e| CashuError::Internal(format!("Failed to parse public key: {:?}", e)))?;
 
     // Create spending condition with our public key
     let spending_condition = cdk::nuts::SpendingConditions::new_p2pk(public_key, None);
@@ -1321,7 +1380,9 @@ pub async fn verify_cashu_token_p2pk(
     wallet
         .verify_token_p2pk(&token_decoded, spending_condition.clone())
         .await
-        .map_err(|e| format!("Token not locked to our public key: {:?}", e))?;
+        .map_err(|e| {
+            CashuError::Unacceptable(format!("Token not locked to our public key: {:?}", e))
+        })?;
 
     info!("✅ Token verified as P2PK-locked to our public key");
 
@@ -1350,7 +1411,10 @@ pub async fn verify_cashu_token_p2pk(
                         .load_keyset_keys(proof.keyset_id)
                         .await
                         .map_err(|e| {
-                            format!("Failed to load keyset keys for DLEQ verification: {}", e)
+                            CashuError::Internal(format!(
+                                "Failed to load keyset keys for DLEQ verification: {}",
+                                e
+                            ))
                         })?;
                     keyset_keys_cache.entry(proof.keyset_id).or_insert(keys)
                 }
@@ -1359,7 +1423,8 @@ pub async fn verify_cashu_token_p2pk(
         } else {
             None
         };
-        verify_proof_dleq_offline(proof, amount_key, require_dleq)?;
+        verify_proof_dleq_offline(proof, amount_key, require_dleq)
+            .map_err(CashuError::BadCredential)?;
     }
     info!(
         "✅ All {} proofs passed NUT-12 DLEQ verification",
@@ -1373,7 +1438,9 @@ pub async fn verify_cashu_token_p2pk(
     let proof_states = wallet
         .check_proofs_spent(proofs.clone())
         .await
-        .map_err(|e| format!("Failed to verify proof state with mint: {:?}", e))?;
+        .map_err(|e| {
+            CashuError::Internal(format!("Failed to verify proof state with mint: {:?}", e))
+        })?;
 
     // Only Unspent is acceptable. Pending / Reserved / PendingSpent all mean the
     // mint already has the proof locked in an in-flight melt or swap; if we
@@ -1388,7 +1455,9 @@ pub async fn verify_cashu_token_p2pk(
             "🚨 P2PK: rejecting token — mint reports a proof in state {:?} (only Unspent is accepted)",
             bad.state
         );
-        return Err("Token contains proofs that are not unspent at the mint".to_string());
+        return Err(CashuError::BadCredential(
+            "Token contains proofs that are not unspent at the mint".to_string(),
+        ));
     }
     info!("✅ Mint confirmed all proofs are unspent");
 
@@ -1403,9 +1472,9 @@ pub async fn verify_cashu_token_p2pk(
     let proof_infos: Vec<ProofInfo> = proofs
         .iter()
         .map(|proof| {
-            let y = proof
-                .y()
-                .map_err(|e| format!("Failed to compute proof y-coordinate: {:?}", e))?;
+            let y = proof.y().map_err(|e| {
+                CashuError::Internal(format!("Failed to compute proof y-coordinate: {:?}", e))
+            })?;
             Ok(ProofInfo {
                 proof: proof.clone(),
                 y,
@@ -1415,7 +1484,7 @@ pub async fn verify_cashu_token_p2pk(
                 spending_condition: Some(spending_condition.clone()),
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, CashuError>>()?;
 
     info!(
         "💾 Storing {} P2PK-locked proofs directly in database (NO swap call)",
@@ -1430,8 +1499,9 @@ pub async fn verify_cashu_token_p2pk(
     // same proofs are rejected by the same atomic SET NX EX slot.
     let claimed = match crate::store_cashu_token_as_used(&proof_replay_key) {
         Ok(false) => {
-            warn!("🚨 Concurrent Cashu replay detected: proof set already claimed");
-            return Ok(false);
+            return Err(CashuError::BadCredential(
+                "Cashu token already used".to_string(),
+            ));
         }
         Ok(true) => true, // won the race — proceed to persist proofs
         Err(crate::ReplayClaimError::NotConfigured) => {
@@ -1451,10 +1521,10 @@ pub async fn verify_cashu_token_p2pk(
                 "❌ Redis unavailable for Cashu P2PK claim — rejecting to prevent replay: {}",
                 e
             );
-            return Err(format!(
+            return Err(CashuError::Internal(format!(
                 "Redis unavailable; refusing Cashu token to prevent replay: {}",
                 e
-            ));
+            )));
         }
     };
 
@@ -1469,7 +1539,10 @@ pub async fn verify_cashu_token_p2pk(
         if claimed {
             crate::release_cashu_token(&proof_replay_key);
         }
-        return Err(format!("Failed to store proofs in database: {:?}", e));
+        return Err(CashuError::Internal(format!(
+            "Failed to store proofs in database: {:?}",
+            e
+        )));
     }
 
     if is_multi_tenant_enabled() {
@@ -1487,7 +1560,7 @@ pub async fn verify_cashu_token_p2pk(
         "✅ ACCEPTED ({} msat stored in CDK database)",
         total_amount_msat
     );
-    Ok(true)
+    Ok(())
 }
 
 pub async fn redeem_to_lightning() -> Result<bool, String> {

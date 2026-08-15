@@ -50,6 +50,29 @@ graph TD;
 
 > **Auto-detect**: When `l402_auto_detect_payment on` is set and the client sends only `Authorization: L402 <macaroon>` (no preimage), the server queries the Lightning node directly. Supported on **LND**, **CLN**, and **Eclair**.
 
+### Response Codes
+
+| Status | When |
+|---|---|
+| `200` | Payment verified — the upstream response is returned |
+| `402` | No credential presented. Carries the `WWW-Authenticate` L402 challenge, and `X-Cashu` when Cashu is enabled |
+| `401` | A credential was presented and failed: malformed, tampered, replayed, or the preimage does not match |
+| `400` | A Cashu token from an unlisted mint, in the wrong unit, or below the price |
+| `429` | Invoice rate limit hit (`l402_invoice_rate_limit`) |
+| `500` | The gateway failed — an unreachable mint or a failed database write, not a problem with your payment |
+
+`402` is used only for the initial challenge. Once a credential is presented,
+a failure is `401`, never `402` — [the L402
+specification](https://github.com/lightninglabs/L402/blob/master/protocol-specification.md)
+requires this so clients can tell "you need to pay" from "your credential is
+broken". The `400` cases are the ones
+[NUT-24](https://github.com/cashubtc/nuts/blob/main/24.md) names.
+
+A `500` on a request that carried a Cashu token leaves the token's fate unknown:
+swapping it at the mint and recording the proofs are separate steps, so a failure
+between them may have spent the token or not touched it. Treat it as an outage
+rather than a rejected payment, and don't discard the token. Other `500`s — a
+missing price, an uninitialised module — are unrelated to payment.
 
 ---
 

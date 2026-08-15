@@ -1110,7 +1110,7 @@ impl L402Module {
         token: &str,
         amount_msat: i64,
         lnurl_addr: Option<String>,
-    ) -> Result<bool, String> {
+    ) -> Result<(), cashu::CashuError> {
         // Check if P2PK mode is enabled (use initialized state, not env vars)
         if cashu::is_p2pk_mode_enabled() {
             info!("🔐 Using P2PK local verification mode");
@@ -1122,17 +1122,21 @@ impl L402Module {
     }
 
     pub fn get_cashu_payment_request(&self, amount_msat: i64) -> Option<String> {
-        // Check if P2PK mode is enabled (use initialized state, not env vars)
-        if !cashu::is_p2pk_mode_enabled() {
+        // Not gated on P2PK: a standard-mode gateway accepts NUT-24 tokens, and
+        // without this challenge a wallet has no way to learn the amount, unit
+        // or accepted mints. cashu.me fails outright on a 402 with no X-Cashu.
+        if !cashu::is_cashu_ecash_enabled() {
             return None;
         }
 
-        // Get whitelisted mints
+        // NUT-24's `m` names the mints a token may come from. With no whitelist
+        // there is nothing to advertise, and the request would send the client
+        // to any mint at all — which verification then rejects.
         if let Some(whitelisted_mints) = cashu::get_whitelisted_mints() {
             match cashu::generate_payment_request(amount_msat, whitelisted_mints) {
                 Ok(req) => {
                     info!(
-                        "✅ Generated X-Cashu payment request (P2PK): {}",
+                        "✅ Generated X-Cashu payment request: {}",
                         &req[..50.min(req.len())]
                     );
                     Some(req)
@@ -1143,7 +1147,7 @@ impl L402Module {
                 }
             }
         } else {
-            error!("❌ No whitelisted mints configured for P2PK mode");
+            error!("❌ No whitelisted mints configured; cannot advertise a Cashu challenge");
             None
         }
     }
@@ -1552,6 +1556,22 @@ impl Merge for ModuleConfig {
             );
             return Err(MergeConfigError::NoValue);
         }
+        // NUT-24's `a` is a whole number of sats, so a sub-sat price is
+        // advertised rounded up while Lightning still charges it exactly. Not
+        // an error — the route works — but the two payment paths quietly
+        // disagree on price, which an operator should hear about once.
+        let cashu_on = std::env::var("CASHU_ECASH_SUPPORT")
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if self.enable && cashu_on && self.amount_msat % 1000 != 0 {
+            eprintln!(
+                "ngx_l402: price {} msat is not a whole number of sats; Cashu clients are \
+                 asked for {} sat while Lightning is charged {} msat.",
+                self.amount_msat,
+                (self.amount_msat + 999) / 1000,
+                self.amount_msat
+            );
+        }
         Ok(())
     }
 }
@@ -1902,9 +1922,27 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
                 None => {}
             }
         }
-        401 => metrics::inc(metrics::Metric::PaymentsInvalidTotal),
+        // 400 joins 401: a Cashu token rejected under NUT-24 is an invalid
+        // payment, same as a bad preimage. 500 stays out — that is our failure,
+        // not the payer's, and must not inflate the invalid-payment count.
+        400 | 401 => metrics::inc(metrics::Metric::PaymentsInvalidTotal),
         402 => metrics::inc(metrics::Metric::PaymentsMissingTotal),
         _ => {}
+    }
+
+    // RFC 9110 requires a 401 to carry a challenge, and every 401 the handler
+    // returns — bad macaroon, bad preimage, replay — had none, leaving clients
+    // with no stated way forward. Naming the scheme is a valid challenge and
+    // costs nothing; minting a fresh invoice for each failed credential is the
+    // expense `l402_invoice_rate_limit` exists to bound, so the client is told
+    // to retry unauthenticated for a full 402 challenge instead.
+    if result == 401 {
+        // SAFETY: `request` is non-null and valid for this handler's lifetime,
+        // as guaranteed by nginx before invoking the handler.
+        unsafe {
+            let req = Request::from_ngx_http_request(request);
+            req.add_header_out("WWW-Authenticate", "L402");
+        }
     }
 
     // Only set L402 header if result is 402
@@ -1947,12 +1985,16 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
             p2pk_mode
         );
 
-        // If P2PK mode is enabled, send X-Cashu header (NUT-24)
-        if cashu_ecash_support && p2pk_mode {
+        // Advertise the NUT-24 challenge whenever Cashu is accepted, not only in
+        // P2PK mode. The request differs between the two — P2PK adds a `nut10`
+        // lock — but a standard-mode gateway still has to state the amount, unit
+        // and mints, or a NUT-24 wallet cannot construct a payable token.
+        if cashu_ecash_support {
             ngx_log_error!(
                 NGX_LOG_INFO,
                 log_ref,
-                "P2PK mode enabled - generating X-Cashu header (NUT-24)"
+                "Generating X-Cashu header (NUT-24, p2pk={})",
+                p2pk_mode
             );
 
             if let Some(cashu_payment_request) = module.get_cashu_payment_request(final_amount) {
@@ -1977,9 +2019,8 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
             ngx_log_error!(
                 NGX_LOG_INFO,
                 log_ref,
-                "X-Cashu header not sent (cashu={} p2pk={})",
-                cashu_ecash_support,
-                p2pk_mode
+                "X-Cashu header not sent (cashu={})",
+                cashu_ecash_support
             );
         }
 
@@ -2149,17 +2190,14 @@ pub fn l402_access_handler(
             }));
 
             match verify_result {
-                Ok(Ok(true)) => {
+                Ok(Ok(())) => {
                     LAST_PAYMENT_METHOD.with(|m| m.set(Some(PaymentMethod::Cashu)));
                     return NGX_DECLINED as isize;
                 }
-                Ok(Ok(false)) => {
-                    info!("⚠️ Cashu token verification failed");
-                    return 401;
-                }
                 Ok(Err(e)) => {
-                    error!("❌ Error verifying Cashu token: {:?}", e);
-                    return 401;
+                    let status = e.http_status();
+                    error!("❌ Error verifying Cashu token ({}): {}", status, e);
+                    return status;
                 }
                 Err(_) => {
                     error!("❌ Panic while verifying Cashu token; returning 500");
@@ -2228,11 +2266,13 @@ pub fn l402_access_handler(
                                 return 500;
                             }
                             Err(_) => {
-                                warn!(
-                                "Auto-detect invoice lookup timed out after {}s — returning 402",
-                                AUTODETECT_LOOKUP_TIMEOUT.as_secs()
-                            );
-                                return 402;
+                                // A timeout means settlement is unknown, not
+                                // that it did not happen.
+                                error!(
+                                    "Invoice lookup timed out after {}s",
+                                    AUTODETECT_LOOKUP_TIMEOUT.as_secs()
+                                );
+                                return 500;
                             }
                         }
                     };
@@ -2768,7 +2808,7 @@ fn handle_dry_run_passthrough(
 
     match would_return {
         200 => metrics::inc(metrics::Metric::DryRunWouldAllowTotal),
-        401 | 402 => metrics::inc(metrics::Metric::DryRunWouldBlockTotal),
+        400..=402 => metrics::inc(metrics::Metric::DryRunWouldBlockTotal),
         _ => {}
     }
     if rate_limited {

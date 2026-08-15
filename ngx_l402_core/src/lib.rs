@@ -8,6 +8,7 @@
 //! runs in seconds with no nginx and no Docker. A silent change to any of these
 //! can strand user funds, so each is pinned by tests in its own module.
 
+mod cashu_error;
 mod escaping;
 mod fee;
 mod l402_header;
@@ -16,6 +17,7 @@ mod rate_limit;
 mod redact;
 mod wallet_seed;
 
+pub use cashu_error::CashuError;
 pub use escaping::{escape_json, html_escape};
 pub use fee::fee_reserve_msat;
 pub use l402_header::parse_l402_header_value;
