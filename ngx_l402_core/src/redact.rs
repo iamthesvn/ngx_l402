@@ -7,7 +7,11 @@ pub fn redact_redis_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    match rest.split_once('@') {
+    // Split on the LAST '@': in a URL authority the userinfo/host delimiter is
+    // the final '@', and an unencoded '@' inside the password is common. Using
+    // the first one would leave the rest of the password in the "host" half and
+    // log it verbatim.
+    match rest.rsplit_once('@') {
         Some((_userinfo, host)) => format!("{}://***@{}", scheme, host),
         None => url.to_string(),
     }
@@ -46,5 +50,13 @@ mod tests {
         let out = redact_redis_url("redis://admin:topsecret@host");
         assert!(!out.contains("topsecret"));
         assert!(!out.contains("admin"));
+    }
+
+    /// An unencoded '@' inside the password must not leak the suffix.
+    #[test]
+    fn redacts_password_containing_at_sign() {
+        let out = redact_redis_url("redis://user:p@ssw0rd@host:6379/0");
+        assert_eq!(out, "redis://***@host:6379/0");
+        assert!(!out.contains("ssw0rd"), "password suffix leaked: {}", out);
     }
 }

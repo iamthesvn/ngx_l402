@@ -8,52 +8,62 @@ const LOG_FILE_PATH: &str = "/var/log/nginx/cashu_redemption.log";
 /// this many times a cycle, and one unreadable path should not fill the log.
 static OPEN_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Open the log for appending, refusing a symlink (`ELOOP`).
+///
+/// `O_NOFOLLOW` is load-bearing: `O_CREAT` follows an existing symlink unless
+/// paired with `O_EXCL`, so a link planted here before startup would redirect
+/// the master's root-privileged fchown/fchmod — and every write — onto its
+/// target. Guards the final component only; the root-owned parent is trusted.
+fn open_log_file() -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(LOG_FILE_PATH)
+}
+
 /// Create the log file and give it to the user the workers run as.
 ///
 /// Called from `init_module`, in the master: the log directory is root-owned,
 /// but redemption writes from a worker. Ownership follows the Cashu data
 /// directory, which the operator already sets — the same rule the database uses.
 pub fn prepare_log_file(data_dir_owner: Option<(u32, u32)>) {
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(LOG_FILE_PATH)
-    {
-        error!("Cannot create {}: {}", LOG_FILE_PATH, e);
-        return;
-    }
+    // fchown/fchmod on the descriptor, not the path — see `open_log_file`.
+    let file = match open_log_file() {
+        Ok(file) => file,
+        Err(e) => {
+            error!(
+                "Cannot create {} (ELOOP = symlink, refused): {}",
+                LOG_FILE_PATH, e
+            );
+            return;
+        }
+    };
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Some((uid, gid)) = data_dir_owner {
-            let _ = std::os::unix::fs::chown(LOG_FILE_PATH, Some(uid), Some(gid));
+            let _ = std::os::unix::fs::fchown(&file, Some(uid), Some(gid));
         }
-        let _ = std::fs::set_permissions(LOG_FILE_PATH, std::fs::Permissions::from_mode(0o640));
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o640));
     }
 }
 
 /// Helper function to log Cashu redemption task messages to a dedicated file.
 /// If file logging fails, errors are logged to the nginx error log.
 ///
-/// `msg` is sanitised before writing: newline and carriage-return characters
-/// are stripped to prevent log-injection attacks.
+/// `msg` is sanitised before writing: all control characters are stripped to
+/// prevent log-injection attacks.
 pub fn log_redemption(msg: &str) {
-    // Strip characters that could be used for log injection:
-    // - CR/LF: inject new log lines
-    // - NUL: truncate log entries in some parsers
-    // - ESC (0x1b): ANSI escape sequences that corrupt terminal/log viewers
-    // - TAB: column-injection in tab-delimited log parsers
-    let sanitised: String = msg
-        .chars()
-        .filter(|&c| c != '\n' && c != '\r' && c != '\0' && c != '\x1b' && c != '\t')
-        .collect();
+    // Whole control range, not a blocklist: CR/LF forge log lines, NUL truncates
+    // entries, ESC injects ANSI, TAB breaks column parsers.
+    let sanitised: String = msg.chars().filter(|c| !c.is_control()).collect();
 
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(LOG_FILE_PATH)
-    {
+    match open_log_file() {
         Ok(mut file) => {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             if let Err(e) = writeln!(file, "[{}] {}", timestamp, sanitised) {

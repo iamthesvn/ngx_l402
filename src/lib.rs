@@ -409,7 +409,7 @@ pub async fn get_or_create_lnurl_client(
 
 /// Fast-fail pre-check: returns true if the preimage is already known-used.
 /// This is NOT the authoritative admission gate — it only avoids wasted CPU
-/// on obvious replays. The atomic SET NX EX in store_preimage_as_used() is
+/// on obvious replays. The atomic SET NX in store_preimage_as_used() is
 /// the true gate and closes the TOCTOU window between concurrent workers.
 /// Fails open (returns false) if Redis is unavailable.
 fn is_preimage_used(preimage: &[u8]) -> bool {
@@ -477,10 +477,20 @@ fn handle_preimage_claim(result: Result<bool, ReplayClaimError>) -> isize {
     }
 }
 
-/// Atomically store a preimage as used via SET NX EX (single round-trip).
+/// Atomically store a preimage as used via SET NX (single round-trip).
 /// Returns Ok(true) if stored successfully (first use), Ok(false) if already existed (race with another worker).
 /// Called ONLY after successful verification to avoid burning preimages on transient failures.
-fn store_preimage_as_used(preimage: &[u8]) -> Result<bool, ReplayClaimError> {
+///
+/// `macaroon_timeout` is the lifetime, in seconds, of the macaroon this preimage
+/// was paired with (`0` = never expires). The marker MUST outlive the macaroon:
+/// if it expires first, the same `L402 <macaroon>:<preimage>` pair passes
+/// `SET NX` again and the payment is replayable once per TTL window forever.
+/// So the marker is persisted with no expiry when the macaroon never expires,
+/// and otherwise held for at least the macaroon's own lifetime.
+fn store_preimage_as_used(
+    preimage: &[u8],
+    macaroon_timeout: i64,
+) -> Result<bool, ReplayClaimError> {
     let pool = redis_pool().ok_or(ReplayClaimError::NotConfigured)?;
 
     let mut conn = pool
@@ -488,19 +498,27 @@ fn store_preimage_as_used(preimage: &[u8]) -> Result<bool, ReplayClaimError> {
         .map_err(|e| ReplayClaimError::Unavailable(format!("connection: {}", e)))?;
 
     let redis_key = preimage_redis_key(preimage);
-    let ttl = get_preimage_ttl();
+    // `None` = store without EX. Never-expiring macaroons need never-expiring
+    // markers; the alternative is a guaranteed replay window once the TTL lapses.
+    let ttl = if macaroon_timeout > 0 {
+        Some(get_preimage_ttl().max(macaroon_timeout as u64))
+    } else {
+        None
+    };
 
-    // SET NX EX — atomic store-if-absent with TTL
-    match redis::cmd("SET")
-        .arg(&redis_key)
-        .arg("used")
-        .arg("NX")
-        .arg("EX")
-        .arg(ttl)
-        .query::<Option<String>>(&mut *conn)
-    {
+    // SET NX [EX ttl] — atomic store-if-absent
+    let mut cmd = redis::cmd("SET");
+    cmd.arg(&redis_key).arg("used").arg("NX");
+    if let Some(ttl) = ttl {
+        cmd.arg("EX").arg(ttl);
+    }
+
+    match cmd.query::<Option<String>>(&mut *conn) {
         Ok(Some(_)) => {
-            info!("✅ Preimage stored as used (TTL: {}s)", ttl);
+            match ttl {
+                Some(ttl) => info!("✅ Preimage stored as used (TTL: {}s)", ttl),
+                None => info!("✅ Preimage stored as used (no expiry — macaroon never expires)"),
+            }
             Ok(true)
         }
         Ok(None) => {
@@ -1324,8 +1342,10 @@ pub struct ModuleConfig {
     // stops inheritance.
     dry_run: Option<bool>,
     // Skip single-use preimage replay check; one payment stays valid for the
-    // macaroon lifetime (pair with l402_macaroon_timeout). Defaults to false.
-    indefinite_access: bool,
+    // macaroon lifetime (pair with l402_macaroon_timeout). `None` means unset
+    // (inherit from parent scope); `Some(false)` explicitly turns it off and
+    // stops inheritance. Defaults to false when never set anywhere.
+    indefinite_access: Option<bool>,
     // When set via `l402_manifest_hide;`, this route is excluded from the
     // `.well-known/l402-services` capability manifest. The route is still gated as
     // normal — this just makes it not discoverable.
@@ -1514,14 +1534,17 @@ impl Merge for ModuleConfig {
         if prev.manifest_hidden {
             self.manifest_hidden = true;
         }
-        if prev.indefinite_access {
-            self.indefinite_access = true;
+        // Same "child wins if set" merge as dry_run: `l402_indefinite_access off;`
+        // in an inner location must override `on` from the outer scope, or the
+        // route silently loses the preimage replay check it explicitly asked for.
+        if self.indefinite_access.is_none() {
+            self.indefinite_access = prev.indefinite_access;
         }
         // A realm token carries one preimage to every path in the realm. The
         // first request claims it and the replay check rejects the rest, so
         // without indefinite access the operator has sold exactly one request.
         // env_logger is not up during config parse — stderr is what nginx shows.
-        if self.enable && self.realm.is_some() && !self.indefinite_access {
+        if self.enable && self.realm.is_some() && !self.indefinite_access.unwrap_or(false) {
             eprintln!(
                 "ngx_l402: l402_realm requires l402_indefinite_access on. Without it the \
                  realm token is accepted once and every later request in the realm is \
@@ -1752,7 +1775,7 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         let invoice_rate_limit = conf.invoice_rate_limit;
         let auto_detect_payment = conf.auto_detect_payment;
         let dry_run = conf.dry_run.unwrap_or(false);
-        let indefinite_access = conf.indefinite_access;
+        let indefinite_access = conf.indefinite_access.unwrap_or(false);
         let realm = conf.realm.clone();
 
         (
@@ -1834,6 +1857,7 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         final_lnurl_addr.clone(),
         auto_detect_payment,
         indefinite_access,
+        macaroon_timeout,
     );
     let auth_duration = auth_start.elapsed();
 
@@ -2083,6 +2107,9 @@ pub fn l402_access_handler(
     lnurl_addr: Option<String>,
     auto_detect_payment: bool,
     indefinite_access: bool,
+    // Macaroon lifetime in seconds (0 = never expires). Sizes the preimage
+    // replay marker so it always outlives the token it protects.
+    macaroon_timeout: i64,
 ) -> isize {
     // Reset so the wrapper never reads a stale method from a prior request.
     LAST_PAYMENT_METHOD.with(|m| m.set(None));
@@ -2240,10 +2267,13 @@ pub fn l402_access_handler(
                             // Subscription mode: allow preimage reuse.
                             return NGX_DECLINED as isize;
                         }
-                        // SET NX EX is the authoritative atomic admission gate.
+                        // SET NX is the authoritative atomic admission gate.
                         // Ok(false) means another worker already claimed this
                         // preimage — treat as replay and reject.
-                        return handle_preimage_claim(store_preimage_as_used(&preimage_bytes));
+                        return handle_preimage_claim(store_preimage_as_used(
+                            &preimage_bytes,
+                            macaroon_timeout,
+                        ));
                     }
                     Err(e) => {
                         warn!("⚠️ L402 auto-detect verification failed: {:?}", e);
@@ -2278,10 +2308,13 @@ pub fn l402_access_handler(
                                 // Subscription mode: allow preimage reuse.
                                 return NGX_DECLINED as isize;
                             }
-                            // SET NX EX is the authoritative atomic admission gate.
+                            // SET NX is the authoritative atomic admission gate.
                             // Ok(false) means another worker already claimed this
                             // preimage — treat as replay and reject.
-                            return handle_preimage_claim(store_preimage_as_used(&preimage.0));
+                            return handle_preimage_claim(store_preimage_as_used(
+                                &preimage.0,
+                                macaroon_timeout,
+                            ));
                         }
                         Err(e) => {
                             warn!("⚠️ L402 verification failed: {:?}", e);
@@ -2971,14 +3004,14 @@ pub unsafe extern "C" fn ngx_http_l402_indefinite_access_set(
             || val.eq_ignore_ascii_case("1")
             || val.eq_ignore_ascii_case("yes")
         {
-            conf.indefinite_access = true;
+            conf.indefinite_access = Some(true);
             info!("⚙️ l402_indefinite_access enabled — preimage replay check disabled for this location");
         } else if val.eq_ignore_ascii_case("off")
             || val.eq_ignore_ascii_case("false")
             || val.eq_ignore_ascii_case("0")
             || val.eq_ignore_ascii_case("no")
         {
-            conf.indefinite_access = false;
+            conf.indefinite_access = Some(false);
         } else {
             error!(
                 "Invalid l402_indefinite_access value: '{}' (expected on/off)",
