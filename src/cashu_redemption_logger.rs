@@ -8,23 +8,37 @@ const LOG_FILE_PATH: &str = "/var/log/nginx/cashu_redemption.log";
 /// this many times a cycle, and one unreadable path should not fill the log.
 static OPEN_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Open the log for appending, refusing a symlink (`ELOOP`).
+///
+/// `O_NOFOLLOW` is load-bearing: `O_CREAT` follows an existing symlink unless
+/// paired with `O_EXCL`, so a link planted here before startup would redirect
+/// the master's root-privileged fchown/fchmod — and every write — onto its
+/// target. Guards the final component only; the root-owned parent is trusted.
+fn open_log_file() -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(LOG_FILE_PATH)
+}
+
 /// Create the log file and give it to the user the workers run as.
 ///
 /// Called from `init_module`, in the master: the log directory is root-owned,
 /// but redemption writes from a worker. Ownership follows the Cashu data
 /// directory, which the operator already sets — the same rule the database uses.
 pub fn prepare_log_file(data_dir_owner: Option<(u32, u32)>) {
-    // Ownership and mode are applied to the open descriptor, never to the path:
-    // a path-based chown/chmod resolves symlinks, so anyone able to pre-create
-    // LOG_FILE_PATH as a link could redirect them onto an arbitrary file.
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(LOG_FILE_PATH)
-    {
+    // fchown/fchmod on the descriptor, not the path — see `open_log_file`.
+    let file = match open_log_file() {
         Ok(file) => file,
         Err(e) => {
-            error!("Cannot create {}: {}", LOG_FILE_PATH, e);
+            error!(
+                "Cannot create {} (ELOOP = symlink, refused): {}",
+                LOG_FILE_PATH, e
+            );
             return;
         }
     };
@@ -45,17 +59,11 @@ pub fn prepare_log_file(data_dir_owner: Option<(u32, u32)>) {
 /// `msg` is sanitised before writing: all control characters are stripped to
 /// prevent log-injection attacks.
 pub fn log_redemption(msg: &str) {
-    // Strip every control character rather than an explicit blocklist. Beyond
-    // the obvious CR/LF (forged log lines), NUL (entry truncation), ESC (ANSI
-    // sequences) and TAB (column injection), this also covers DEL, the rest of
-    // C0, and the C1 range — any of which can corrupt a log viewer or parser.
+    // Whole control range, not a blocklist: CR/LF forge log lines, NUL truncates
+    // entries, ESC injects ANSI, TAB breaks column parsers.
     let sanitised: String = msg.chars().filter(|c| !c.is_control()).collect();
 
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(LOG_FILE_PATH)
-    {
+    match open_log_file() {
         Ok(mut file) => {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             if let Err(e) = writeln!(file, "[{}] {}", timestamp, sanitised) {
