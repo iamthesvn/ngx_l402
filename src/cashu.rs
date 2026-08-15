@@ -1197,8 +1197,8 @@ pub async fn verify_cashu_token(
                 "❌ Cashu token receive failed from mint {}: {}",
                 mint_url, e
             );
-            // Err, not Ok(false): the swap may already have consumed the token
-            // at the mint, so the caller must not answer "your token is bad".
+            // Internal, not a payer fault: the swap may already have consumed
+            // the token at the mint, so the answer must not be "yours was bad".
             Err(CashuError::Internal(format!("mint receive failed: {}", e)))
         }
     }
