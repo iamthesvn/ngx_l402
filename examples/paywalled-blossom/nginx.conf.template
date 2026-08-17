@@ -75,49 +75,26 @@ http {
             proxy_set_header X-Forwarded-Proto $scheme;
         }
 
-        # --- Paywalled: uploads (pay to store a blob; it auto-expires after the
-        # blossom 90-day retention window). Anyone can pay and upload — there is
-        # no pubkey whitelist, the payment IS the gate.
+        # --- Uploads: FREE (fall through to `location /` below). ---
+        # Uploads must stay free to work with vanilla Blossom clients (noci,
+        # and every other) — none of them pay L402 to PUT a blob. Cost is
+        # recovered on the paid *download* plus the 90-day auto-expiry.
         #
-        # Deliberately NOT a realm: each stored blob consumes disk for 90 days, so
-        # payment is per upload. A write realm would mean "pay once, upload all you
-        # like until the token expires" — fine for a trusted batch publisher, wrong
-        # for an open store. To opt into that, add:
-        #     l402_realm "blossom-write"; l402_macaroon_timeout <short>;
-        #     l402_indefinite_access on;
-        # and price it for the window rather than the blob.
+        # Pay-to-upload is possible but needs an L402-aware uploader that does
+        # not exist yet. To re-enable it (and build that client), restore:
         #
-        # Note a read token can't be spent here regardless: realms don't cross, and
-        # the macaroon also binds the HTTP method (GET token ≠ PUT token).
-        #
-        # CAVEAT: a vanilla Blossom client PUTs the blob, gets 402, then re-sends it
-        # with payment — so a large blob crosses the wire twice, and the client must
-        # speak L402 (not plain Blossom).
-        location = /upload {
-            l402 on;
-            l402_amount_msat_default 100000;   # price to store one blob — tune this
-            l402_macaroon_timeout    0;        # single-use: one payment = one upload
+        #   location = /upload {
+        #       l402 on;
+        #       l402_amount_msat_default 100000;   # pay to store one blob
+        #       l402_macaroon_timeout    0;        # single-use: one pay = one upload
+        #       proxy_pass http://$blossom_backend; ...
+        #   }
+        #   # /mirror also stores a blob, so gate it the same way, else it's a
+        #   # free way around the upload gate.
+        #   location = /mirror { l402 on; l402_amount_msat_default 100000;
+        #       l402_macaroon_timeout 0; proxy_pass http://$blossom_backend; ... }
 
-            proxy_pass http://$blossom_backend;
-            proxy_set_header Host $host;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-        }
-
-        # /mirror also stores a blob (it fetches one from another server), so it
-        # gets the same price — otherwise it's a free way around the upload gate.
-        location = /mirror {
-            l402 on;
-            l402_amount_msat_default 100000;
-            l402_macaroon_timeout    0;
-
-            proxy_pass http://$blossom_backend;
-            proxy_set_header Host $host;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-        }
-
-        # --- Free: HEAD, list, dashboard, and everything else. ---
+        # --- Free: uploads, HEAD, list, dashboard, and everything else. ---
         location / {
             proxy_pass http://$blossom_backend;
             proxy_set_header Host $host;
