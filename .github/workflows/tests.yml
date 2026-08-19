@@ -329,7 +329,7 @@ jobs:
           fi
           echo "PASS: /json-logs returned 429 over the rate limit"
 
-          # Let nginx flush the error log before asserting on it.
+          # Let nginx flush the container logs before asserting on them.
           sleep 2
           logs=$(docker logs nginx-lnurl 2>&1)
 
