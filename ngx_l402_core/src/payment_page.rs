@@ -392,14 +392,48 @@ document.getElementById('preimage-section').classList.remove('hidden')\">Enter p
     }});
   }}
   function showContent(r) {{
-    // Paywalled content isn't always HTML (e.g. a video blob); r.text() +
-    // document.write() would garble it and hang the tab on a large file.
+    // Paywalled content isn't always HTML (e.g. a video blob). Top-level
+    // navigation to a blob: URL is silently blocked by browsers from an
+    // async callback — no error, nothing happens. Renderable media is
+    // embedded in the current page instead (a normal resource load, never
+    // restricted); anything else gets a real link, since only a genuine
+    // click can open a blob: URL.
     const ct = r.headers.get('Content-Type') || '';
     if (ct.startsWith('text/html')) {{
-      r.text().then(html => {{ document.open(); document.write(html); document.close(); }});
-    }} else {{
-      r.blob().then(blob => {{ window.location.href = URL.createObjectURL(blob); }});
+      r.text().then(html => {{ document.open(); document.write(html); document.close(); }})
+        .catch(e => showUnlockError(String(e)));
+      return;
     }}
+    r.blob().then(blob => {{
+      const url = URL.createObjectURL(blob);
+      const name = location.pathname.split('/').pop() || 'file';
+      document.body.innerHTML = '';
+      let el;
+      if (ct.startsWith('video/') || ct.startsWith('audio/')) {{
+        el = document.createElement(ct.startsWith('video/') ? 'video' : 'audio');
+        el.controls = true; el.autoplay = true;
+      }} else if (ct.startsWith('image/')) {{
+        el = document.createElement('img');
+      }}
+      if (el) {{
+        el.src = url;
+        el.style.cssText = 'max-width:100%;max-height:90vh;display:block;margin:2rem auto;border-radius:.75rem;';
+        document.body.appendChild(el);
+      }} else {{
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        a.textContent = 'Download ' + name;
+        a.style.cssText = 'display:block;width:fit-content;margin:3rem auto;padding:.9rem 1.6rem;background:var(--accent);color:#fff;border-radius:.75rem;font-weight:600;text-decoration:none;font-family:Inter,sans-serif;';
+        document.body.appendChild(a);
+      }}
+    }}).catch(e => showUnlockError(String(e)));
+  }}
+  function showUnlockError(msg) {{
+    document.body.innerHTML = '';
+    const p = document.createElement('p');
+    p.style.cssText = 'color:var(--error);text-align:center;margin-top:3rem;font-family:Inter,sans-serif;';
+    p.textContent = 'Payment verified, but the content could not be loaded: ' + msg;
+    document.body.appendChild(p);
   }}
   function submitPreimage() {{
     const hex = document.getElementById('preimage-input').value.trim();
@@ -695,7 +729,50 @@ mod tests {
         );
         assert!(
             html.contains("r.blob()") && html.contains("createObjectURL"),
-            "a non-HTML response must be routed through a blob URL, not document.write"
+            "a non-HTML response must be read as a blob, not decoded as text"
+        );
+    }
+
+    /// Browsers silently block a script-driven top-level navigation to a
+    /// blob: URL (no error, no navigation) — `location.href = objectUrl`
+    /// looks correct but hangs forever. Renderable media must be embedded
+    /// in place instead, and anything else must be a real link the payer
+    /// clicks themselves, since only a genuine click can open one.
+    #[test]
+    fn non_html_content_is_embedded_or_linked_not_navigated_to() {
+        let html = render(true, false, None);
+        assert!(
+            !html.contains("location.href = URL.createObjectURL")
+                && !html.contains("location.href=URL.createObjectURL"),
+            "navigating the page to a blob: URL is silently blocked by browsers and must not be used"
+        );
+        assert!(
+            html.contains("createElement(ct.startsWith('video/')"),
+            "video/audio must be embedded inline, not navigated to"
+        );
+        assert!(
+            html.contains("createElement('img')"),
+            "images must be embedded inline, not navigated to"
+        );
+        assert!(
+            html.contains("a.download = name") && html.contains("a.href = url"),
+            "any other content type must offer a real, clickable download link"
+        );
+    }
+
+    /// A failure inside showContent's own async chain (a network blip
+    /// mid-download) must not leave the page stuck on "Verifying..." with
+    /// no feedback — that read as an indefinite hang with nothing to debug.
+    #[test]
+    fn show_content_failures_are_not_silently_swallowed() {
+        let html = render(true, false, None);
+        assert!(
+            html.contains("function showUnlockError"),
+            "a failure path must exist to surface errors instead of hanging silently"
+        );
+        assert!(
+            html.matches(".catch(e => showUnlockError(String(e)))").count() >= 2,
+            "both the HTML and the blob branch of showContent must handle rejection"
         );
     }
 }
