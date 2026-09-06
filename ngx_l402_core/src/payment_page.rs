@@ -771,7 +771,9 @@ mod tests {
             "a failure path must exist to surface errors instead of hanging silently"
         );
         assert!(
-            html.matches(".catch(e => showUnlockError(String(e)))").count() >= 2,
+            html.matches(".catch(e => showUnlockError(String(e)))")
+                .count()
+                >= 2,
             "both the HTML and the blob branch of showContent must handle rejection"
         );
     }
