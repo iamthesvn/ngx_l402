@@ -393,6 +393,12 @@ fn wallet_mnemonic_file_path(db_url: &str) -> Option<String> {
 /// at the umask's default permissions, and `O_NOFOLLOW` refuses a symlink: this
 /// writes the BIP39 phrase controlling every Cashu fund, and `O_CREAT` alone
 /// follows an existing link, which would deliver it to the link's target.
+///
+/// Neither guards the *name*. POSIX gives unlink and rename to whoever can write
+/// the directory, whatever the file inside it is owned by, so anyone who can
+/// write `path`'s parent replaces the phrase outright, no symlink needed. The
+/// parent is the trust boundary and must be owned by the user this process runs
+/// as.
 fn persist_mnemonic(path: &str, mnemonic: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
