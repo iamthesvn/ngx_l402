@@ -1,9 +1,28 @@
 name: Security Audit
 
+# Run only when the audit's inputs change: the workspace lockfile and
+# manifests that define the dependency graph, plus this workflow itself (the
+# --ignore flags below live here). Two inputs this filter cannot see: the
+# RustSec advisory database, which changes on its own schedule -- the weekly
+# cron bounds that drift to 7 days -- and the cargo-audit version, which
+# floats to the latest release at install time. Note the filter is an
+# inclusion list, so a misclassified path can only run the audit needlessly,
+# never skip a real change. stress-test/Cargo.lock sits outside the workspace
+# and is not audited here at all, filtered or not (known gap, tracked
+# separately).
+# The paths list is duplicated under push and pull_request rather than shared
+# via a YAML anchor because the ngit-ci parser that runs the mirrored copy of
+# this file is unverified against anchors; 4 lines of duplication is the
+# cheaper risk.
 on:
   push:
     branches:
       - main
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'ngx_l402_core/Cargo.toml'
+      - '.github/workflows/audit.yml'
   pull_request:
   schedule:
     # Re-run weekly so newly-disclosed advisories are caught even without a push.
