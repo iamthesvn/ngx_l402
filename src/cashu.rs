@@ -236,6 +236,13 @@ fn resolve_wallet_mnemonic(db_url: &str) -> Result<(), String> {
 
     let file_path = wallet_mnemonic_file_path(db_url);
 
+    // Only reached when the phrase comes from a file. Setting
+    // CASHU_WALLET_MNEMONIC returns above, and is the way to have no file to
+    // attack at all.
+    if let Some(ref path) = file_path {
+        warn_if_wallet_dir_is_shared(path);
+    }
+
     // 2. Previously persisted mnemonic.
     if let Some(ref path) = file_path {
         if let Ok(contents) = std::fs::read_to_string(path) {
@@ -480,12 +487,15 @@ fn check_wallet_fingerprint(db_url: &str) -> Result<(), String> {
 }
 
 /// Path of the fingerprint sidecar file, beside the SQLite database.
+/// The fingerprint lives beside the mnemonic, not beside the database.
+///
+/// They are one secret and one tripwire for that secret, so they have to share
+/// a trust boundary: a fingerprint an attacker can delete is no tripwire at all.
+/// Deriving this from the mnemonic path means `CASHU_WALLET_MNEMONIC_FILE` moves
+/// both out of the worker-writable data directory with one setting.
 fn wallet_fingerprint_file_path(db_url: &str) -> Option<String> {
-    let raw = db_url
-        .trim()
-        .trim_start_matches("sqlite://")
-        .trim_start_matches("sqlite:");
-    let parent = std::path::Path::new(raw).parent()?;
+    let mnemonic = wallet_mnemonic_file_path(db_url)?;
+    let parent = std::path::Path::new(&mnemonic).parent()?;
     Some(
         parent
             .join("wallet.fingerprint")
@@ -493,6 +503,54 @@ fn wallet_fingerprint_file_path(db_url: &str) -> Option<String> {
             .into_owned(),
     )
 }
+
+/// Warn if the directory holding the mnemonic can be written by anyone other
+/// than the user this process runs as.
+///
+/// `O_NOFOLLOW` and mode 0600 protect the *file*; neither protects the *name*.
+/// POSIX gives unlink and rename to whoever can write the directory, regardless
+/// of who owns the file inside it, so a worker that can write this directory can
+/// delete the mnemonic and drop in a phrase of its own — no symlink needed. The
+/// next master start then derives the attacker's wallet and every subsequent
+/// payment is received into it, surviving the cleanup of whatever gave them the
+/// worker in the first place.
+///
+/// This runs in the master before workers fork, so `geteuid` is the privileged
+/// user and any other writer is by definition less trusted.
+#[cfg(unix)]
+fn warn_if_wallet_dir_is_shared(mnemonic_path: &str) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(dir) = std::path::Path::new(mnemonic_path).parent() else {
+        return;
+    };
+    let Ok(md) = std::fs::metadata(dir) else {
+        return;
+    };
+
+    // SAFETY: geteuid is always successful and takes no arguments.
+    let me = unsafe { libc::geteuid() };
+    let mode = md.mode();
+    let group_or_other_writable = mode & 0o022 != 0;
+    let owned_by_someone_else = md.uid() != me;
+
+    if group_or_other_writable || owned_by_someone_else {
+        warn!(
+            "⚠️ {} holds the Cashu wallet mnemonic but is writable by a user other than this \
+             process (dir uid={}, mode={:o}, we are uid={}). Anyone with that access can replace \
+             the phrase — file permissions do not stop it, because POSIX lets whoever can write a \
+             directory unlink what is in it. Set CASHU_WALLET_MNEMONIC from a secrets manager, or \
+             point CASHU_WALLET_MNEMONIC_FILE at a directory only this user can write.",
+            dir.display(),
+            md.uid(),
+            mode & 0o7777,
+            me,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_wallet_dir_is_shared(_mnemonic_path: &str) {}
 
 /// Persist the wallet fingerprint beside the database.
 ///
