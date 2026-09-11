@@ -13,9 +13,14 @@ use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
 use url::Url;
 
-// Thread-local storage to track processed tokens
+// Per-worker replay cache for Cashu tokens, used when Redis is not configured.
+// Shares `ngx_l402_core::ReplayCache` with the preimage path so both credential
+// types get the same bounded, FIFO-evicting protection: dropping the whole set
+// at capacity would let an attacker push `cap` fresh tokens through and then
+// replay an older one.
 thread_local! {
-    static PROCESSED_TOKENS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+    static PROCESSED_TOKENS: RefCell<ngx_l402_core::ReplayCache> =
+        RefCell::new(ngx_l402_core::ReplayCache::default());
 }
 
 const MSAT_PER_SAT: u64 = 1000;
@@ -194,10 +199,6 @@ async fn get_or_create_wallet(
     Ok(guard.entry(key).or_insert(wallet).clone())
 }
 
-/// Maximum number of entries in the thread-local PROCESSED_TOKENS cache.
-/// When exceeded, the set is cleared. Redis remains the authoritative replay check.
-const MAX_PROCESSED_TOKENS: usize = 10_000;
-
 /// Number of words in a freshly generated wallet mnemonic. 12 words = 128 bits
 /// of entropy (the common Cashu default).
 const GENERATED_MNEMONIC_WORDS: usize = 12;
@@ -294,10 +295,15 @@ fn resolve_wallet_mnemonic(db_url: &str) -> Result<(), String> {
 ///
 /// The master creates them as root; the workers that use them run as nginx.
 /// The data directory already names that user, so follow it.
+///
+/// Ownership and mode are applied to an `O_NOFOLLOW` descriptor, never to the
+/// path. This runs as root, so a path-based chown here is a privilege-
+/// escalation primitive: a symlink planted at `<db>-wal` would hand the link's
+/// target to the worker user with mode 0660.
 fn set_db_ownership(db_url: &str) {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let path = std::path::Path::new(
             db_url
@@ -318,10 +324,30 @@ fn set_db_ownership(db_url: &str) {
             if !file.exists() {
                 continue;
             }
+
+            // Read-only is enough: fchown/fchmod act on the descriptor, and
+            // opening the SQLite files this way does not disturb them.
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&file);
+
+            let handle = match opened {
+                Ok(handle) => handle,
+                Err(e) => {
+                    warn!(
+                        "⚠️ Not adjusting ownership of {} (ELOOP = symlink, refused): {}",
+                        file.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
             if let Some((uid, gid)) = owner {
-                let _ = std::os::unix::fs::chown(&file, Some(uid), Some(gid));
+                let _ = std::os::unix::fs::fchown(&handle, Some(uid), Some(gid));
             }
-            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o660));
+            let _ = handle.set_permissions(std::fs::Permissions::from_mode(0o660));
         }
     }
     #[cfg(not(unix))]
@@ -365,25 +391,35 @@ fn wallet_mnemonic_file_path(db_url: &str) -> Option<String> {
 /// Persist the mnemonic to `path` with owner-only permissions where supported.
 ///
 /// On unix the file is created with mode 0600 up front, so it is never visible
-/// at the umask's default permissions.
+/// at the umask's default permissions, and `O_NOFOLLOW` refuses a symlink: this
+/// writes the BIP39 phrase controlling every Cashu fund, and `O_CREAT` alone
+/// follows an existing link, which would deliver it to the link's target.
+///
+/// Neither guards the *name*. POSIX gives unlink and rename to whoever can write
+/// the directory, whatever the file inside it is owned by, so anyone who can
+/// write `path`'s parent replaces the phrase outright, no symlink needed. The
+/// parent is the trust boundary and must be owned by the user this process runs
+/// as.
 fn persist_mnemonic(path: &str, mnemonic: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .map_err(|e| format!("open {}: {}", path, e))?;
+            .map_err(|e| format!("open {} (ELOOP = symlink, refused): {}", path, e))?;
         f.write_all(format!("{}\n", mnemonic).as_bytes())
             .map_err(|e| format!("write {}: {}", path, e))?;
-        // An existing file keeps its own mode on open, so set it explicitly too.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        // An existing file keeps its own mode on open, so set it explicitly —
+        // on the descriptor, since a path-based call would follow a symlink
+        // swapped in after the open.
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
     #[cfg(not(unix))]
     {
@@ -458,30 +494,43 @@ fn wallet_fingerprint_file_path(db_url: &str) -> Option<String> {
     )
 }
 
+/// Persist the wallet fingerprint beside the database.
+///
+/// `fs::write` and a path-based chmod both follow symlinks, and this runs as
+/// root in the master — a link planted here would redirect the write, and the
+/// chmod, onto an arbitrary file. Open with `O_NOFOLLOW` and set the mode on
+/// the descriptor instead.
 fn persist_fingerprint(path: &str, fingerprint: &str) -> Result<(), String> {
-    std::fs::write(path, format!("{}\n", fingerprint))
-        .map_err(|e| format!("write {}: {}", path, e))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| format!("open {} (ELOOP = symlink, refused): {}", path, e))?;
+        f.write_all(format!("{}\n", fingerprint).as_bytes())
+            .map_err(|e| format!("write {}: {}", path, e))?;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, format!("{}\n", fingerprint))
+            .map_err(|e| format!("write {}: {}", path, e))?;
     }
     Ok(())
 }
 
-/// Add token to thread-local cache, clearing if at capacity.
+/// Record a token as spent in the per-worker cache. Eviction is FIFO, so at
+/// capacity only the oldest entry is dropped and recent tokens stay protected.
 fn cache_processed_token(token: &str) {
     PROCESSED_TOKENS.with(|tokens| {
-        if let Some(set) = tokens.borrow_mut().as_mut() {
-            if set.len() >= MAX_PROCESSED_TOKENS {
-                debug!(
-                    "🔄 PROCESSED_TOKENS cache at capacity ({}), clearing",
-                    MAX_PROCESSED_TOKENS
-                );
-                set.clear();
-            }
-            set.insert(token.to_string());
-        }
+        tokens.borrow_mut().claim(token);
     });
 }
 
@@ -583,10 +632,8 @@ pub fn initialize_ln_client(client_type: String) -> Result<(), String> {
 }
 
 pub fn initialize_cashu(db_url: &str) -> Result<(), String> {
-    // Initialize PROCESSED_TOKENS with empty HashSet
-    PROCESSED_TOKENS.with(|tokens| {
-        *tokens.borrow_mut() = Some(HashSet::new());
-    });
+    // PROCESSED_TOKENS needs no init — the thread-local is created empty on
+    // first use in whichever worker touches it.
 
     // Set Cashu eCash enabled flag
     let _ = CASHU_ECASH_ENABLED.set(true);
@@ -1025,13 +1072,7 @@ pub async fn verify_cashu_token(
     debug!("🔍 Verifying Cashu token, checking database connection...");
 
     // Check thread-local memory cache first (fastest path — no I/O)
-    let token_already_processed = PROCESSED_TOKENS.with(|tokens| {
-        if let Some(set) = tokens.borrow().as_ref() {
-            set.contains(token)
-        } else {
-            false
-        }
-    });
+    let token_already_processed = PROCESSED_TOKENS.with(|tokens| tokens.borrow().contains(token));
 
     if token_already_processed {
         warn!("🚨 Replay attack detected: Cashu token already used (memory cache)");
@@ -1214,12 +1255,7 @@ pub async fn verify_cashu_token_p2pk(
     info!("🔐 P2PK mode: Optimized token verification");
 
     // Check thread-local memory cache first (fastest path — no I/O)
-    let token_seen = PROCESSED_TOKENS.with(|tokens| {
-        tokens
-            .borrow()
-            .as_ref()
-            .is_some_and(|set| set.contains(token))
-    });
+    let token_seen = PROCESSED_TOKENS.with(|tokens| tokens.borrow().contains(token));
 
     if token_seen {
         warn!("🚨 Replay attack detected: Cashu token already used (memory cache)");
@@ -1505,9 +1541,21 @@ pub async fn verify_cashu_token_p2pk(
         }
         Ok(true) => true, // won the race — proceed to persist proofs
         Err(crate::ReplayClaimError::NotConfigured) => {
-            // Redis was never configured — an explicit operator choice. Fall
-            // back to the in-process memory cache (single-worker protection).
+            // Redis was never configured — an explicit operator choice. Claim in
+            // the per-worker cache instead, and claim by *proof key*: the raw
+            // token check at the top of this function cannot see the same proofs
+            // re-encoded into a different string, and this path stores proofs
+            // without a mint swap, so nothing downstream catches it either
+            // (`update_proofs` upserts on a conflicting Y value rather than
+            // failing). Without this claim a re-encoded token is served free,
+            // repeatedly.
             warn!("⚠️ Redis not configured — Cashu replay protection is in-process only (single-worker)");
+            if !PROCESSED_TOKENS.with(|t| t.borrow_mut().claim(&proof_replay_key)) {
+                error!("🚨 Replay attack detected: proof set already used (in-process cache)");
+                return Err(CashuError::BadCredential(
+                    "Cashu token already used".to_string(),
+                ));
+            }
             false
         }
         Err(crate::ReplayClaimError::Unavailable(e)) => {
@@ -1531,13 +1579,14 @@ pub async fn verify_cashu_token_p2pk(
     // Store directly in database using update_proofs (same as receive_proofs does internally)
     // Pass empty vec for second parameter (no proofs to delete)
     if let Err(e) = wallet.localstore.update_proofs(proof_infos, vec![]).await {
-        // The DB write failed after we took the replay claim. Release the claim
-        // so the token isn't stuck "used" — otherwise a legitimate retry would
-        // be rejected until the Redis TTL expires even though no proofs were
-        // ever persisted. (Only release if we actually claimed; the fail-open
-        // branch above holds no claim to release.)
+        // The DB write failed after we took the replay claim. Release it so the
+        // token isn't stuck "used" — otherwise a legitimate retry would be
+        // rejected even though no proofs were ever persisted. Whichever store
+        // holds the claim is the one to release.
         if claimed {
             crate::release_cashu_token(&proof_replay_key);
+        } else {
+            PROCESSED_TOKENS.with(|t| t.borrow_mut().release(&proof_replay_key));
         }
         return Err(CashuError::Internal(format!(
             "Failed to store proofs in database: {}",
@@ -1551,9 +1600,10 @@ pub async fn verify_cashu_token_p2pk(
         }
     }
 
-    // Cache both the raw token string and the proof-based key so that both
-    // exact-string and re-encoded replay attempts are caught on the fast
-    // thread-local path without a Redis round-trip.
+    // Cache the raw token so an identical resubmission short-circuits at the top
+    // of this function without touching Redis. The proof key is claimed above
+    // when Redis is absent; claiming it again here is a no-op that keeps both
+    // paths writing the same two entries.
     cache_processed_token(&proof_replay_key);
     cache_processed_token(token);
     info!(
