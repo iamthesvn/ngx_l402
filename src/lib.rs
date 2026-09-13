@@ -3340,12 +3340,6 @@ pub unsafe extern "C" fn l402_metrics_content_handler(r: *mut ngx_http_request_t
     unsafe { req.output_filter(&mut *chain).0 }
 }
 
-/// Directive handler for `l402_dry_run on|off;`.
-///
-/// # Safety
-/// `cf` and `conf` are the valid, non-null pointers Nginx passes to
-/// directive-parsing callbacks; `conf` points to this location's
-/// `ModuleConfig`. `(*cf).args` holds exactly one argument because the
 /// Directive handler for `l402_payment_html on|off;`.
 ///
 /// `off` serves the 402 with its `WWW-Authenticate` (and `X-Cashu`) headers but
