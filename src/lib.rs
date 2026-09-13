@@ -1799,6 +1799,34 @@ unsafe fn send_html_response(r: *mut ngx_http_request_t, status: u16, body: Stri
     NGX_DONE as isize
 }
 
+/// Send `status` with its already-attached headers and no body.
+///
+/// A bare `return 402` is not bodyless: nginx's special-response handler fills
+/// in its built-in page for every 4xx. Marking the request header-only is what
+/// drops the body. Returns `NGX_DONE` for the reason `send_html_response` does.
+///
+/// # Safety
+/// `r` must be the valid, non-null request pointer nginx passed to the handler.
+unsafe fn send_empty_response(r: *mut ngx_http_request_t, status: u16) -> isize {
+    let rc = unsafe { ngx_http_discard_request_body(r) };
+    if rc != NGX_OK as ngx_int_t {
+        return rc as isize;
+    }
+
+    // Before borrowing `r` as a Request, so the raw write does not alias it.
+    unsafe { (*r).set_header_only(1) };
+    let req = unsafe { Request::from_ngx_http_request(r) };
+    req.set_status(HTTPStatus(status as usize));
+    req.set_content_length_n(0);
+
+    let send_status = req.send_header();
+    if send_status.0 == NGX_ERROR as ngx_int_t || send_status.0 > NGX_OK as ngx_int_t {
+        return send_status.0;
+    }
+    unsafe { ngx_http_finalize_request(r, send_status.0) };
+    NGX_DONE as isize
+}
+
 // Per-worker scratch slot used by `l402_access_handler` to report *which*
 // payment method satisfied a successful verification. The wrapper consumes it
 // only in enforce mode (after the dry-run early return) so shadow traffic
@@ -2299,9 +2327,10 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
                 //
                 // `l402_payment_html off` stops here: the challenge headers are
                 // already attached, and an API client or agent only discards the
-                // page. Falling through returns a bodyless 402.
+                // page.
                 if !payment_html {
-                    return 402;
+                    // SAFETY: `request` is the valid pointer nginx passed to this handler.
+                    return unsafe { send_empty_response(request, 402) };
                 }
                 if let Some((macaroon_b64, invoice)) =
                     ngx_l402_core::parse_l402_header_value(&header_value)
