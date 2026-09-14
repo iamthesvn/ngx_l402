@@ -1,6 +1,5 @@
 use l402_middleware::caveats::RequestBinding;
 use l402_middleware::lndrpc::lnrpc;
-use l402_middleware::middleware::L402Middleware;
 use l402_middleware::{bolt12, cln, eclair, l402, lnclient, lnd, lnurl, macaroon_util, nwc, utils};
 use log::{debug, error, info, warn};
 use ngx::core::Buffer;
@@ -792,7 +791,7 @@ pub fn extract_payment_hash_from_auth_str(auth_str: &str) -> Result<Vec<u8>, Str
 }
 
 pub struct L402Module {
-    middleware: L402Middleware,
+    root_key: Vec<u8>,
 }
 
 impl L402Module {
@@ -1013,40 +1012,19 @@ impl L402Module {
                 }
             }
             _ => {
-                warn!("⚠️ Unknown client type, defaulting to LNURL");
-                let address =
-                    std::env::var("LNURL_ADDRESS").unwrap_or_else(|_| "lnurl_address".to_string());
-                info!("🔗 Using LNURL address: {}", address);
-                lnclient::LNClientConfig {
-                    ln_client_type,
-                    lnd_config: None,
-                    lnurl_config: Some(lnurl::LNURLOptions { address }),
-                    nwc_config: None,
-                    cln_config: None,
-                    bolt12_config: None,
-                    eclair_config: None,
-                    root_key: require_root_key()?,
-                }
+                // Fail at startup, not per request: an unknown type would
+                // otherwise boot and 500 every protected request on lazy init.
+                return Err(format!(
+                    "unknown LN_CLIENT_TYPE '{}'; expected LND, LNURL, NWC, CLN, BOLT12, or ECLAIR",
+                    ln_client_type
+                ));
             }
         };
 
-        info!("🔧 Creating L402 middleware");
-        let middleware = L402Middleware::new_l402_middleware(
-            ln_client_config.clone(),
-            Arc::new(move |_| {
-                Box::pin(async move {
-                    0 // Placeholder value, declaring for type inference
-                })
-            }),
-            Arc::new(|req| vec![format!("RequestPath = {}", req.uri().path())]),
-        )
-        .await
-        // Display, not Debug: this call receives a config holding root_key, and
-        // Debug would print it if an error ever captured one.
-        .map_err(|e| format!("Failed to create L402 middleware: {}", e))?;
+        let root_key = ln_client_config.root_key.clone();
 
         let _ = LN_CLIENT_CONFIG.set(ln_client_config);
-        Ok(Self { middleware })
+        Ok(Self { root_key })
     }
 
     /// Auto-detect settlement: ask the worker's LN client whether the invoice
@@ -1092,8 +1070,6 @@ impl L402Module {
 
         debug!("Invoice value: {} msat", amount_msat);
 
-        // If a per-location LNURL address is provided, use cached LNURL client
-        // Otherwise use the global ln_client from middleware
         let (invoice, payment_hash) = if let Some(ref addr) = lnurl_addr {
             debug!("Using per-location LNURL address for invoice: {}", addr);
 
@@ -1114,11 +1090,9 @@ impl L402Module {
                 }
             }
         } else {
-            // The LN client embedded in the module was created in the nginx
-            // master process. After fork(), the tonic Channel's epoll I/O
-            // registrations are absent from the worker's event loop, causing
-            // "Service was not ready: transport error" on the first RPC.
-            // Use a per-worker client lazily created within HANDLER_RUNTIME.
+            // Use a per-worker client lazily created within HANDLER_RUNTIME:
+            // a client created in the nginx master process loses its tonic
+            // Channel epoll registrations across fork(), failing the first RPC.
             let ln_client = match WORKER_LN_CLIENT
                 .get_or_try_init(|| async {
                     let config = LN_CLIENT_CONFIG.get().ok_or_else(
@@ -1158,11 +1132,7 @@ impl L402Module {
             caveats.push(format!("ExpiresAt = {}", expiry));
         }
 
-        match macaroon_util::get_macaroon_as_string(
-            payment_hash,
-            caveats,
-            self.middleware.root_key.clone(),
-        ) {
+        match macaroon_util::get_macaroon_as_string(payment_hash, caveats, self.root_key.clone()) {
             Ok(macaroon_string) => {
                 let header_value = l402::format_challenge(&macaroon_string, &invoice);
                 debug!("🍪 Generated macaroon header: {}", header_value);
@@ -2197,10 +2167,10 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         // Caveats for the 402 challenge come from the same binding, so the
         // minted token matches what verification will expect (realm-aware).
         let challenge_caveats = binding.to_caveats();
-        // Catch any panic from the LNURL library (bare .unwrap() calls in
-        // l402_middleware's lnurl.rs can panic on network errors). Without this
-        // guard a panic would unwind through nginx's C stack — undefined
-        // behaviour in a cdylib that crashes the worker process (curl exit 52).
+        // Defense in depth: a panic from the LNURL library unwinding
+        // through nginx's C stack is UB in a cdylib and crashes the worker.
+        // 2.3.4 propagates errors instead of panicking, but the dependency
+        // boundary isn't ours to trust, so the guard stays.
         // Backends bound connecting, not the call, so an unanswered request
         // would hold this worker until the client gave up. Generous because a
         // worker's first request builds its own channel: this catches a request
@@ -2507,12 +2477,7 @@ pub fn l402_access_handler(
                 preimage_arr.copy_from_slice(&preimage_bytes);
                 let preimage = lightning::types::payment::PaymentPreimage(preimage_arr);
 
-                match l402::verify_l402_binding(
-                    &mac,
-                    binding,
-                    module.middleware.root_key.clone(),
-                    preimage,
-                ) {
+                match l402::verify_l402_binding(&mac, binding, module.root_key.clone(), preimage) {
                     Ok(_) => {
                         info!("✅ L402 auto-detect verification successful");
                         LAST_PAYMENT_METHOD.with(|m| m.set(Some(PaymentMethod::Lightning)));
@@ -2551,7 +2516,7 @@ pub fn l402_access_handler(
                     match l402::verify_l402_binding(
                         &mac,
                         binding,
-                        module.middleware.root_key.clone(),
+                        module.root_key.clone(),
                         preimage,
                     ) {
                         Ok(_) => {
@@ -2767,9 +2732,8 @@ pub unsafe extern "C" fn init_module(cycle: *mut ngx_cycle_s) -> isize {
             for addr in lnurl_addrs {
                 // Pre-warming is purely an optimization (workers create the
                 // client lazily anyway), so a transient LNURL outage must never
-                // be fatal. Upstream client creation can panic (it unwraps the
-                // HTTP response); catch it so the panic cannot unwind across the
-                // FFI boundary and abort the master.
+                // be fatal. Keep the guard as defense in depth: a panic
+                // unwinding across the FFI boundary would abort the master.
                 let prewarm = std::panic::AssertUnwindSafe(get_or_create_lnurl_client(&addr));
                 match futures::FutureExt::catch_unwind(prewarm).await {
                     Ok(Ok(_)) => info!("✅ Pre-warmed LNURL client cache for: {}", addr),
@@ -2784,7 +2748,8 @@ pub unsafe extern "C" fn init_module(cycle: *mut ngx_cycle_s) -> isize {
             Ok::<L402Module, String>(m)
         });
 
-        // A missing or too-short ROOT_KEY lands here. Reporting it as `[emerg]`
+        // Startup config errors (missing/short ROOT_KEY, unknown
+        // LN_CLIENT_TYPE) land here. Reporting them as `[emerg]`
         // plus -1 is what nginx expects; panicking would abort the master,
         // since there is nothing to unwind into across the FFI boundary.
         let module = match module {
