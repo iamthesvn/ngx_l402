@@ -38,7 +38,7 @@ docker run -d \
   -e CERT_FILE_PATH=/app/data/tls.cert \
   -e CASHU_ECASH_SUPPORT=true \
   -e CASHU_WALLET_MNEMONIC="word1 word2 ... word12" \
-  -e CASHU_DB_PATH=/app/data/db/cashu_tokens.db \
+  -e CASHU_DB_PATH=/app/data/cashu_tokens.db \
   -e CASHU_WHITELISTED_MINTS=https://mint1.example.com,https://mint2.example.com \
   -e CASHU_REDEEM_ON_LIGHTNING=true \
   -e REDIS_URL=redis://redis:6379 \
@@ -73,7 +73,7 @@ docker run -d \
   -e ROOT_KEY=your-32-byte-hex-key \
   -e CASHU_ECASH_SUPPORT=true \
   -e CASHU_WALLET_MNEMONIC="word1 word2 ... word12" \
-  -e CASHU_DB_PATH=/app/data/db/cashu_tokens.db \
+  -e CASHU_DB_PATH=/app/data/cashu_tokens.db \
   -v ~/.lightning/bitcoin/lightning-rpc:/app/data/lightning-rpc:ro \
   ghcr.io/ngx-l402/ngx-l402:latest
 ```
@@ -104,7 +104,7 @@ docker run -d \
   -e CASHU_P2PK_MODE=true \
   -e CASHU_P2PK_PRIVATE_KEY=your-32-byte-hex-private-key \
   -e CASHU_WALLET_MNEMONIC="word1 word2 ... word12" \
-  -e CASHU_DB_PATH=/app/data/db/cashu_tokens.db \
+  -e CASHU_DB_PATH=/app/data/cashu_tokens.db \
   -e CASHU_WHITELISTED_MINTS=https://mint1.example.com \
   -e CASHU_REDEEM_ON_LIGHTNING=true \
   -e REDIS_URL=redis://redis:6379 \

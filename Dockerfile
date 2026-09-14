@@ -40,49 +40,22 @@ COPY index.html /usr/share/nginx/html/shadow/index.html
 COPY index.html /usr/share/nginx/html/tenant1/index.html
 COPY index.html /usr/share/nginx/html/tenant2/index.html
 
-# Cashu state is split across two directories with different owners.
-#
-# The database must be writable by the workers. The mnemonic must not be: POSIX
-# grants unlink to whoever can write a directory, whatever the file inside it is
-# owned by, so a compromised worker sharing a directory with the phrase can
-# replace it and receive every later payment into its own wallet. Mode 0600 and
-# O_NOFOLLOW do not help — they protect the file, not the name.
-#
-# A mounted volume hides ownership set at build time, so the entrypoint sets it
-# on every start, and migrates the flat layout earlier images used.
-ENV CASHU_DB_PATH=/app/data/db/cashu_tokens.db \
-    CASHU_WALLET_MNEMONIC_FILE=/app/data/secrets/wallet.mnemonic
-# No `set -e` here: a skipped migration step must not leave the ownership
-# below unapplied, and `[ ... ] && mv` under -e is exactly the shape that
-# would do that.
+# Cashu data dir. Root owns it and nginx writes through the group; the sticky
+# bit lets nginx delete or rename only its own files, so the root-owned wallet
+# phrase is out of its reach. A mounted volume hides ownership set at build
+# time, so the entrypoint sets it on every start.
 RUN printf '%s\n' \
     '#!/bin/sh' \
-    'd=$(dirname "${CASHU_DB_PATH:-/app/data/db/cashu_tokens.db}")' \
-    's=$(dirname "${CASHU_WALLET_MNEMONIC_FILE:-/app/data/secrets/wallet.mnemonic}")' \
-    'mkdir -p "$d" "$s" || exit 1' \
-    '' \
-    '# Pre-split volumes kept everything in one nginx-owned directory.' \
-    'for f in wallet.mnemonic wallet.fingerprint; do' \
-    '  if [ -f "/app/data/$f" ] && [ ! -e "$s/$f" ]; then' \
-    '    mv "/app/data/$f" "$s/$f"' \
-    '  fi' \
-    'done' \
-    'for f in /app/data/cashu_tokens.db*; do' \
-    '  if [ -f "$f" ] && [ ! -e "$d/$(basename "$f")" ]; then' \
-    '    mv "$f" "$d/"' \
-    '  fi' \
-    'done' \
-    '' \
-    'chown -R nginx:nginx "$d"' \
-    'chmod 750 "$d"' \
-    '' \
-    '# root-owned and 0700. The master resolves the mnemonic in init_module,' \
-    '# before it forks, so no worker ever needs to read this — and a worker that' \
-    '# could write the directory could replace the phrase whatever the file mode.' \
-    'chown -R root:root "$s"' \
-    'chmod 700 "$s"' \
-    'find "$s" -type f -exec chmod 600 {} +' \
-    'exit 0' \
+    'd=$(dirname "${CASHU_DB_PATH:-/app/data/cashu_tokens.db}")' \
+    'mkdir -p "$d" || exit 1' \
+    '# Earlier images gave nginx everything, wallet files included. Take those' \
+    '# back once, while nginx still owns the directory: after that, a wallet' \
+    '# file nginx creates stays nginx-owned and the module refuses it.' \
+    'if [ "$(stat -c %U "$d")" != root ]; then' \
+    '  chown -h root:root "$d/wallet.mnemonic" "$d/wallet.fingerprint" 2>/dev/null' \
+    'fi' \
+    'find "$d" -mindepth 1 ! -name wallet.mnemonic ! -name wallet.fingerprint -exec chown -h nginx:nginx {} + || exit 1' \
+    'chown root:nginx "$d" && chmod 1770 "$d"' \
     > /docker-entrypoint.d/05-cashu-data-perms.sh \
     && chmod +x /docker-entrypoint.d/05-cashu-data-perms.sh
 

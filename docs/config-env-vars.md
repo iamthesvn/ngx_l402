@@ -147,13 +147,12 @@ Environment=L402_CASHU_TOKEN_TTL_SECONDS=2147483647
 
 ```bash
 Environment=CASHU_ECASH_SUPPORT=true
-Environment=CASHU_DB_PATH=/var/lib/nginx/db/cashu_tokens.db
+Environment=CASHU_DB_PATH=/var/lib/nginx/cashu_tokens.db
 # BIP39 wallet mnemonic (the Cashu/NUT-13 backup phrase). Leave unset to have one
-# generated and saved on first run (check the logs for the phrase).
+# generated and saved next to the DB on first run (check the logs for the phrase).
 Environment=CASHU_WALLET_MNEMONIC="word1 word2 ... word12"
-# Where a generated mnemonic is persisted. Must NOT be the DB directory — a
-# worker that can write that directory can replace the phrase. See below.
-Environment=CASHU_WALLET_MNEMONIC_FILE=/var/lib/nginx/secrets/wallet.mnemonic
+# Optional: where to persist a generated mnemonic (defaults beside the DB file)
+# Environment=CASHU_WALLET_MNEMONIC_FILE=/var/lib/nginx/wallet.mnemonic
 
 # Optional: Whitelist specific mints (comma-separated)
 # In standard mode: if not set, all mints are accepted
@@ -167,41 +166,10 @@ Environment=CASHU_REDEMPTION_INTERVAL_SECS=3600  # default: 1 hour
 
 > **⚠️ Security**: `CASHU_WALLET_MNEMONIC` is the BIP39 phrase that derives the wallet seed (NUT-13). It is the only backup of your wallet — anyone with it can steal your tokens, and losing it loses the funds!
 > - 12 or 24 English words; restorable in any NUT-13 wallet (nutshell, cashu-ts, cdk-cli)
-> - If unset, one is generated and saved to `CASHU_WALLET_MNEMONIC_FILE` on first run — **back it up**
-> - On startup the module records a fingerprint of the seed beside the mnemonic and refuses to start if a later phrase doesn't match (so a changed/typo'd phrase can't silently orphan a funded wallet); delete the `wallet.fingerprint` file to switch wallets intentionally
+> - If unset, one is generated and saved beside the DB on first run — **back it up**
+> - On startup the module records a fingerprint of the seed next to the DB and refuses to start if a later mnemonic doesn't match (so a changed/typo'd phrase can't silently orphan a funded wallet); delete the `wallet.fingerprint` file to switch wallets intentionally
 > - Never commit it to Git; keep it in a secrets manager
-
-### Where the mnemonic is stored
-
-**Keep it out of any directory nginx workers can write.** File permissions are
-not enough on their own: POSIX grants `unlink` and `rename` to whoever can write
-a *directory*, whatever the file inside it is owned by. A worker that shares a
-directory with the phrase can delete it and write one of its own, and the next
-start derives the attacker's wallet — so every later payment is received into it,
-outliving whatever cleanup you do to the worker.
-
-The container image therefore splits the two:
-
-```
-/app/data/secrets/   root:root 0700   mnemonic + fingerprint (master only)
-/app/data/db/        nginx:nginx 0750 SQLite database (workers write this)
-```
-
-The module warns at startup if the mnemonic's directory is owned by another user
-or is group/other-writable. If you see that warning, either move the file:
-
-```bash
-Environment=CASHU_WALLET_MNEMONIC_FILE=/etc/ngx-l402/wallet.mnemonic   # root:root 0700 dir
-```
-
-or, better in production, set `CASHU_WALLET_MNEMONIC` from a secrets manager —
-then there is no file to replace. The fingerprint follows the mnemonic, so one
-setting moves both.
-
-> **Upgrading**: images before this change kept everything in `/app/data`. The
-> entrypoint moves the database and the wallet files into the two directories
-> above on first start; nothing to do by hand. If you set `CASHU_DB_PATH` or
-> `CASHU_WALLET_MNEMONIC_FILE` yourself, point them at separate directories.
+> - A phrase or fingerprint *file* is trusted only if the user nginx's master runs as owns it and no one else can write it; anything else is refused. Keep its directory root-owned and sticky (`chown root:nginx`, `chmod 1770`), as the Docker image does: nginx then writes the database but can't delete, rename or replace the phrase. The module warns at startup when another user could
 
 ### Redemption Fee Handling
 

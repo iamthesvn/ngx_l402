@@ -261,7 +261,7 @@ services:
       - LNURL_ADDRESS=${LNURL_ADDRESS}
       - ROOT_KEY=${ROOT_KEY}
       - CASHU_ECASH_SUPPORT=true
-      - CASHU_DB_PATH=/app/data/db/cashu_tokens.db
+      - CASHU_DB_PATH=/app/data/cashu_tokens.db
       - CASHU_WALLET_MNEMONIC=${CASHU_WALLET_MNEMONIC}
       - CASHU_REDEEM_ON_LIGHTNING=true
       - CASHU_REDEMPTION_INTERVAL_SECS=15
@@ -357,7 +357,7 @@ services:
       - LND_ADDRESS=lndnode-receiver:10010
       - ROOT_KEY=${ROOT_KEY}
       - CASHU_ECASH_SUPPORT=true
-      - CASHU_DB_PATH=/app/data/db/cashu_tokens.db
+      - CASHU_DB_PATH=/app/data/cashu_tokens.db
       - CASHU_WALLET_MNEMONIC=${CASHU_WALLET_MNEMONIC}
       - CASHU_REDEEM_ON_LIGHTNING=true
       - CASHU_REDEMPTION_INTERVAL_SECS=15

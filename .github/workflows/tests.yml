@@ -1731,10 +1731,10 @@ jobs:
           # Test Cashu eCash support
           echo "Testing Cashu eCash support..."
 
-          # Ensure the Cashu database has proper permissions
+          # Ensure the Cashu database has proper permissions. Leave the data
+          # directory alone: the image makes it sticky, and a chmod would clear it.
           echo "Setting up Cashu database permissions..."
-          docker exec nginx-lnd chmod 770 /app/data/db
-          docker exec nginx-lnd chmod 660 /app/data/db/cashu_tokens.db
+          docker exec nginx-lnd chmod 660 /app/data/cashu_tokens.db
           echo "Cashu database permissions set successfully"
           
           # Check mint logs
@@ -1909,14 +1909,14 @@ jobs:
 
           # Delete Cashu database while container is still running
           echo "Deleting Cashu database..."
-          docker exec nginx-lnd rm -f /app/data/db/cashu_tokens.db /app/data/db/cashu_tokens.db-shm /app/data/db/cashu_tokens.db-wal
+          docker exec nginx-lnd rm -f /app/data/cashu_tokens.db /app/data/cashu_tokens.db-shm /app/data/cashu_tokens.db-wal
 
           # Restart the container to trigger initialization and restore_wallets_state
           docker-compose -f docker-compose.yml restart nginx-lnd
 
           # Wait for container and database initialization
           sleep 10
-          docker exec nginx-lnd chmod 660 /app/data/db/cashu_tokens.db || echo 'Warning: could not set permissions'
+          docker exec nginx-lnd chmod 660 /app/data/cashu_tokens.db || echo 'Warning: could not set permissions'
 
           echo "Minting external token for DB regeneration test..."
           NEW_CASHU_TOKEN=$(docker exec cashu-mint poetry run cashu send 15)
@@ -1939,7 +1939,7 @@ jobs:
           # Delete both wallet files from inside the running container (same UID)
           # so that on the next start there is no env var AND no persisted file,
           # forcing the generation path.
-          docker exec nginx-lnd rm -f /app/data/secrets/wallet.fingerprint /app/data/secrets/wallet.mnemonic
+          docker exec nginx-lnd rm -f /app/data/wallet.fingerprint /app/data/wallet.mnemonic
           # Start without CASHU_WALLET_MNEMONIC in the env so a mnemonic is generated
           CASHU_WALLET_MNEMONIC="" docker-compose -f docker-compose.yml up -d --no-deps nginx-lnd
           # nginx serves only after module init, which is when the mnemonic is
@@ -1948,16 +1948,42 @@ jobs:
           wait_http http://0.0.0.0:8000/ 200 90 || { docker logs nginx-lnd | tail -30; exit 1; }
           # A wallet.mnemonic file must have been created
           MNEMONIC_FILE=$(docker run --rm -v ngx-l402_cashu-data:/data alpine \
-            sh -c 'cat /data/secrets/wallet.mnemonic 2>/dev/null || echo ""')
+            sh -c 'cat /data/wallet.mnemonic 2>/dev/null || echo ""')
           if [ -z "$MNEMONIC_FILE" ]; then
             echo "❌ No wallet.mnemonic generated on first run"
             docker logs nginx-lnd | tail -30
             exit 1
           fi
           echo "✅ wallet.mnemonic generated on first run"
+          # Root owns the data directory and the phrase; nginx writes the database
+          # through the group, and the sticky bit keeps it off files it doesn't
+          # own. Prove it as the nginx user rather than trusting the mode bits.
+          dir_perms=$(docker exec nginx-lnd stat -c '%U:%G %a' /app/data)
+          phrase_perms=$(docker exec nginx-lnd stat -c '%U:%G %a' /app/data/wallet.mnemonic)
+          if [ "$dir_perms" != "root:nginx 1770" ] || [ "$phrase_perms" != "root:root 600" ]; then
+            echo "❌ Expected root:nginx 1770 and root:root 600, got '$dir_perms' and '$phrase_perms'"
+            exit 1
+          fi
+          for attempt in \
+            'cat /app/data/wallet.mnemonic' \
+            'echo x >> /app/data/wallet.mnemonic' \
+            'mv /app/data/wallet.mnemonic /app/data/moved' \
+            'rm /app/data/wallet.mnemonic' \
+            'echo x > /app/data/planted && mv -f /app/data/planted /app/data/wallet.mnemonic'; do
+            if docker exec -u nginx nginx-lnd sh -c "$attempt" 2>/dev/null; then
+              echo "❌ The nginx user could: $attempt"
+              exit 1
+            fi
+          done
+          docker exec nginx-lnd rm -f /app/data/planted
+          if docker logs nginx-lnd 2>&1 | grep -q "can be deleted or renamed"; then
+            echo "❌ Startup warned about the data directory the image just secured"
+            exit 1
+          fi
+          echo "✅ The nginx user cannot read, change, move, delete or replace the wallet mnemonic"
           # A fingerprint must have been recorded
           FP1=$(docker run --rm -v ngx-l402_cashu-data:/data alpine \
-            sh -c 'cat /data/secrets/wallet.fingerprint 2>/dev/null | tr -d "[:space:]" || echo ""')
+            sh -c 'cat /data/wallet.fingerprint 2>/dev/null | tr -d "[:space:]" || echo ""')
           if [ -z "$FP1" ]; then
             echo "❌ No wallet.fingerprint recorded on first run"
             exit 1
@@ -1968,16 +1994,28 @@ jobs:
           docker-compose -f docker-compose.yml restart nginx-lnd
           wait_http http://0.0.0.0:8000/ 200 90 || { docker logs nginx-lnd | tail -30; exit 1; }
           FP2=$(docker run --rm -v ngx-l402_cashu-data:/data alpine \
-            sh -c 'cat /data/secrets/wallet.fingerprint 2>/dev/null | tr -d "[:space:]" || echo ""')
+            sh -c 'cat /data/wallet.fingerprint 2>/dev/null | tr -d "[:space:]" || echo ""')
           if [ "$FP1" != "$FP2" ]; then
             echo "❌ Fingerprint changed across restart ($FP1 != $FP2) — mnemonic not persisted"
             exit 1
           fi
           echo "✅ Auto-generated mnemonic persists across restarts (fingerprint stable: $FP1)"
+          # While the phrase is missing nginx can still create one, so the module
+          # must refuse a wallet.mnemonic it doesn't own rather than adopt it.
+          docker exec nginx-lnd rm -f /app/data/wallet.mnemonic /app/data/wallet.fingerprint
+          docker exec -u nginx nginx-lnd sh -c 'echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" > /app/data/wallet.mnemonic'
+          docker-compose -f docker-compose.yml restart nginx-lnd
+          wait_http http://0.0.0.0:8000/ 200 90 || { docker logs nginx-lnd | tail -30; exit 1; }
+          if ! docker logs nginx-lnd 2>&1 | grep -q "wallet.mnemonic is owned by uid"; then
+            echo "❌ The module adopted a wallet.mnemonic written by the nginx user"
+            docker logs nginx-lnd | tail -30
+            exit 1
+          fi
+          echo "✅ A wallet.mnemonic written by the nginx user is refused"
           # Restore: delete auto-generated wallet files from inside the running
           # container (same UID/GID) then recreate with the known test mnemonic.
           # Using docker exec avoids alpine UID-mapping issues on the named volume.
-          docker exec nginx-lnd rm -f /app/data/secrets/wallet.fingerprint /app/data/secrets/wallet.mnemonic
+          docker exec nginx-lnd rm -f /app/data/wallet.fingerprint /app/data/wallet.mnemonic
           CASHU_WALLET_MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
             docker-compose -f docker-compose.yml up -d --no-deps nginx-lnd
           sleep 15
@@ -1987,13 +2025,13 @@ jobs:
             docker logs nginx-lnd | tail -30
             exit 1
           fi
-          docker exec nginx-lnd chmod 660 /app/data/db/cashu_tokens.db || echo 'Warning: could not set permissions'
+          docker exec nginx-lnd chmod 660 /app/data/cashu_tokens.db || echo 'Warning: could not set permissions'
 
           # --- Wallet-mnemonic fingerprint guard ---
           # A fingerprint that no longer matches the configured mnemonic must
           # refuse Cashu init, so a changed/typo'd mnemonic can't orphan funds.
           echo "Testing wallet fingerprint guard (mismatch must refuse init)..."
-          docker exec nginx-lnd sh -c 'echo corrupt-fingerprint > /app/data/secrets/wallet.fingerprint'
+          docker exec nginx-lnd sh -c 'echo corrupt-fingerprint > /app/data/wallet.fingerprint'
           docker-compose -f docker-compose.yml restart nginx-lnd
           sleep 10
           if docker logs nginx-lnd 2>&1 | grep -q "does not match the wallet that owns"; then
@@ -2004,43 +2042,11 @@ jobs:
             exit 1
           fi
           # Restore: remove the corrupt fingerprint so it is re-recorded correctly.
-          docker exec nginx-lnd rm -f /app/data/secrets/wallet.fingerprint
+          docker exec nginx-lnd rm -f /app/data/wallet.fingerprint
           docker-compose -f docker-compose.yml restart nginx-lnd
           sleep 10
-          docker exec nginx-lnd chmod 660 /app/data/db/cashu_tokens.db || echo 'Warning: could not set permissions'
+          docker exec nginx-lnd chmod 660 /app/data/cashu_tokens.db || echo 'Warning: could not set permissions'
           echo "✅ Wallet fingerprint guard test passed!"
-
-          # The mnemonic and its fingerprint must sit outside anything a worker
-          # can write. Mode 0600 on the file is not enough: POSIX gives unlink to
-          # whoever can write the *directory*, so a compromised worker sharing a
-          # directory with the phrase can delete it and drop in its own.
-          echo "Checking the wallet secrets are not in a worker-writable directory..."
-          secrets_dir=$(docker exec nginx-lnd sh -c 'dirname "$CASHU_WALLET_MNEMONIC_FILE"')
-          db_dir=$(docker exec nginx-lnd sh -c 'dirname "$CASHU_DB_PATH"')
-          if [ "$secrets_dir" = "$db_dir" ]; then
-            echo "FAIL: mnemonic shares a directory with the database ($secrets_dir)"
-            exit 1
-          fi
-          # Owned by root, 0700, and its parent not writable by nginx either.
-          owner=$(docker exec nginx-lnd stat -c '%U %a' "$secrets_dir")
-          if [ "$owner" != "root 700" ]; then
-            echo "FAIL: $secrets_dir is '$owner', expected 'root 700'"
-            exit 1
-          fi
-          parent_owner=$(docker exec nginx-lnd stat -c '%U' "$(dirname "$secrets_dir")")
-          if [ "$parent_owner" != "root" ]; then
-            echo "FAIL: $(dirname "$secrets_dir") is owned by $parent_owner — nginx could unlink the secrets dir itself"
-            exit 1
-          fi
-          # Prove it rather than trusting the mode bits, and probe the directory
-          # rather than the file: writing the directory is what grants unlink,
-          # and this holds whether or not a mnemonic file exists right now.
-          if docker exec -u nginx nginx-lnd sh -c "touch $secrets_dir/probe" 2>/dev/null; then
-            echo "FAIL: the nginx user can create files in $secrets_dir, so it can replace the mnemonic"
-            docker exec nginx-lnd rm -f "$secrets_dir/probe"
-            exit 1
-          fi
-          echo "PASS: wallet secrets are root-owned in $secrets_dir; the worker cannot replace them"
 
           echo "All Cashu eCash tests completed successfully!"
           docker logs nginx-lnd
@@ -2059,7 +2065,7 @@ jobs:
           echo "🔑 Testing Cashu P2PK mode (NUT-11/NUT-24)..."
 
           # Restart nginx-lnd with P2PK mode enabled
-          docker exec nginx-lnd rm -f /app/data/secrets/wallet.fingerprint /app/data/secrets/wallet.mnemonic
+          docker exec nginx-lnd rm -f /app/data/wallet.fingerprint /app/data/wallet.mnemonic
           docker-compose -f docker-compose.yml up -d --no-deps nginx-lnd
           sleep 15
           # Recreating the container resets the writable layer, losing the
@@ -2142,13 +2148,13 @@ jobs:
           # on "Witness is missing for p2pk signature" / melt 400s — starving
           # the redemption queue and breaking the next test that expects a
           # plain token to be auto-redeemed.
-          docker exec nginx-lnd rm -f /app/data/secrets/wallet.fingerprint /app/data/secrets/wallet.mnemonic \
-            /app/data/db/cashu_tokens.db /app/data/db/cashu_tokens.db-shm /app/data/db/cashu_tokens.db-wal
+          docker exec nginx-lnd rm -f /app/data/wallet.fingerprint /app/data/wallet.mnemonic \
+            /app/data/cashu_tokens.db /app/data/cashu_tokens.db-shm /app/data/cashu_tokens.db-wal
           env -u CASHU_P2PK_MODE -u CASHU_P2PK_PRIVATE_KEY -u CASHU_REQUIRE_DLEQ \
             docker-compose -f docker-compose.yml up -d --no-deps nginx-lnd
           sleep 15
           docker exec nginx-lnd chmod 755 /root
-          docker exec nginx-lnd chmod 660 /app/data/db/cashu_tokens.db || echo 'Warning: could not set permissions'
+          docker exec nginx-lnd chmod 660 /app/data/cashu_tokens.db || echo 'Warning: could not set permissions'
           echo "✅ Cashu P2PK mode tests passed!"
 
       - name: Run Integration test - Redis Replay Attack Prevention
@@ -2609,7 +2615,7 @@ jobs:
           echo "Stopping nginx-lnd and starting nginx-lnurl for multi-tenant LNURL mode..."
           # Remove wallet files from inside the running container (same UID/GID as nginx)
           # before stopping, so nginx-lnurl can start fresh with its own mnemonic.
-          docker exec nginx-lnd rm -f /app/data/secrets/wallet.fingerprint /app/data/secrets/wallet.mnemonic
+          docker exec nginx-lnd rm -f /app/data/wallet.fingerprint /app/data/wallet.mnemonic
           docker-compose -f docker-compose.yml stop nginx-lnd
           # --no-deps, or redis loses its replay and pricing state.
           docker-compose -f docker-compose.yml up -d --no-deps nginx-lnurl
