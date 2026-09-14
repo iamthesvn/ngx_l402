@@ -1,5 +1,4 @@
 use crate::cashu_redemption_logger;
-use crate::REDIS_POOL;
 use cdk::mint_url::MintUrl;
 use l402_middleware::lnclient;
 use l402_middleware::lndrpc::lnrpc;
@@ -158,6 +157,9 @@ static CASHU_REQUIRE_DLEQ: OnceLock<bool> = OnceLock::new();
 static LN_CLIENT: tokio::sync::OnceCell<Arc<tokio::sync::Mutex<dyn lnclient::LNClient>>> =
     tokio::sync::OnceCell::const_new();
 static LN_CLIENT_TYPE: OnceLock<String> = OnceLock::new();
+/// LNURL_ADDRESS as the master saw it: where proofs with no tenant mapping are
+/// redeemed. Workers cannot read the environment.
+static DEFAULT_LNURL_ADDRESS: OnceLock<String> = OnceLock::new();
 
 // Resolved BIP39 wallet mnemonic — the Cashu/NUT-13 backup phrase. Set once at
 // init (initialize_cashu) from CASHU_WALLET_MNEMONIC, a persisted file, or a
@@ -616,6 +618,10 @@ pub fn is_multi_tenant_enabled() -> bool {
 /// thread's runtime via `LN_CLIENT` to avoid inheriting broken tonic Channels
 /// from the nginx master process after fork().
 pub fn initialize_ln_client(client_type: String) -> Result<(), String> {
+    if let Ok(address) = std::env::var("LNURL_ADDRESS") {
+        let _ = DEFAULT_LNURL_ADDRESS.set(address);
+    }
+
     LN_CLIENT_TYPE
         .set(client_type.clone())
         .map_err(|_| "LN_CLIENT_TYPE already initialized".to_string())?;
@@ -850,7 +856,15 @@ pub fn get_whitelisted_mints() -> Option<&'static HashSet<String>> {
 }
 
 fn get_lnurl_from_proof(proof: &cdk::nuts::Proof) -> Result<Option<String>, String> {
-    let pool = REDIS_POOL.get().ok_or("Redis pool is not initialised")?;
+    // Without Redis no mapping was ever recorded, so the default address is
+    // right. A configured Redis that can't be reached still holds the tenant's
+    // mapping: fail, and the caller keeps the proofs for the next cycle.
+    let Some(pool) = crate::redis_pool() else {
+        return match crate::redis_absence_reason() {
+            crate::ReplayClaimError::NotConfigured => Ok(None),
+            unavailable => Err(unavailable.to_string()),
+        };
+    };
 
     let mut conn = pool
         .get()
@@ -876,9 +890,10 @@ fn set_proof_to_lnurl(
     proofs: cdk::nuts::Proofs,
     lnurl_route: Option<String>,
 ) -> Result<(), String> {
-    let pool = REDIS_POOL.get().ok_or("Redis pool is not initialised")?;
+    let pool = crate::redis_pool().ok_or_else(|| crate::redis_absence_reason().to_string())?;
 
-    let lnurl = lnurl_route.unwrap_or_else(|| std::env::var("LNURL_ADDRESS").unwrap_or_default());
+    let lnurl =
+        lnurl_route.unwrap_or_else(|| DEFAULT_LNURL_ADDRESS.get().cloned().unwrap_or_default());
 
     if lnurl.is_empty() {
         return Err("No LNURL address available for cashu token".to_string());
@@ -893,7 +908,9 @@ fn set_proof_to_lnurl(
     // melt that keeps failing — would otherwise leave its key in Redis forever.
     // Expire well past the redemption interval so a live mapping is never lost
     // while an abandoned one still goes away on its own.
-    let ttl = proof_lnurl_ttl_secs();
+    // The master's parse: a worker has no environment to read.
+    let interval = crate::CASHU_REDEEM_INTERVAL.get().copied().unwrap_or(0);
+    let ttl = ngx_l402_core::proof_mapping_ttl_secs(interval);
 
     for proof in proofs {
         let secret = proof.secret.to_string();
@@ -911,26 +928,9 @@ fn set_proof_to_lnurl(
     Ok(())
 }
 
-/// Lifetime of a proof-to-LNURL mapping, in seconds.
-///
-/// Sized from the redemption interval so a mapping always outlives the cycle
-/// that would consume it: 20 intervals, floored at 24h and capped at 30 days.
-/// A mapping that expires early would send that tenant's proofs to the default
-/// address, so the floor matters more than the ceiling.
-fn proof_lnurl_ttl_secs() -> u64 {
-    const DAY: u64 = 86_400;
-    let interval = std::env::var("CASHU_REDEMPTION_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(3600);
-
-    interval.saturating_mul(20).clamp(DAY, 30 * DAY)
-}
-
 /// Remove proof-to-lnurl mappings from Redis after proofs have been melted
 fn remove_proof_lnurl_mappings(proofs: &cdk::nuts::Proofs) -> Result<(), String> {
-    let pool = REDIS_POOL.get().ok_or("Redis pool is not initialised")?;
+    let pool = crate::redis_pool().ok_or_else(|| crate::redis_absence_reason().to_string())?;
 
     let mut conn = pool
         .get()
@@ -958,8 +958,10 @@ fn group_proofs_by_lnurl(
     proofs: cdk::nuts::Proofs,
 ) -> Result<HashMap<String, cdk::nuts::Proofs>, String> {
     let mut grouped: HashMap<String, cdk::nuts::Proofs> = HashMap::new();
-    let default_lnurl = std::env::var("LNURL_ADDRESS")
-        .map_err(|_| "LNURL_ADDRESS is required for multi-tenant mode".to_string())?;
+    let default_lnurl = DEFAULT_LNURL_ADDRESS
+        .get()
+        .cloned()
+        .ok_or("LNURL_ADDRESS is required for multi-tenant mode")?;
 
     for proof in proofs {
         // Distinguish "no mapping recorded" from "could not read the mapping".
