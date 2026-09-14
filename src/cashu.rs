@@ -1208,46 +1208,29 @@ pub async fn verify_cashu_token(
         .await
         .map_err(CashuError::Internal)?;
 
-    match wallet
-        .receive(token, cdk::wallet::ReceiveOptions::default())
-        .await
-    {
-        Ok(_) => {
+    // A tenant's proofs have to be mapped as the wallet will redeem them, and
+    // `receive` can't: it swaps them for new proofs and returns only an amount.
+    let received = if is_multi_tenant_enabled() {
+        receive_for_tenant(&wallet, &token_decoded, lnurl_addr).await
+    } else {
+        wallet
+            .receive(token, cdk::wallet::ReceiveOptions::default())
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+
+    match received {
+        Ok(()) => {
             info!(
                 "✅ Cashu token received successfully from mint: {}",
                 mint_url
             );
 
-            if is_multi_tenant_enabled() {
-                // Use only the proofs from this specific token, not all wallet
-                // proofs. The wallet is shared across tenants, so
-                // get_unspent_proofs() would return other tenants' proofs and
-                // overwrite their LNURL mappings.
-                let keysets_info = wallet.get_mint_keysets().await.map_err(|e| {
-                    CashuError::Internal(format!(
-                        "Failed to get keysets for proof extraction: {}",
-                        e
-                    ))
-                })?;
-                match token_decoded.proofs(&keysets_info) {
-                    Ok(proofs) => {
-                        if let Err(e) = set_proof_to_lnurl(proofs, lnurl_addr) {
-                            warn!("⚠️ Failed to set proof-to-lnurl mapping: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "⚠️ Failed to extract proofs from token for lnurl mapping: {}",
-                            e
-                        );
-                    }
-                }
-            }
-
             // Atomic claim outcomes: Ok(true) = first claim (admit),
             // Ok(false) = concurrent replay (reject), Err = Redis unconfigured
             // or unavailable. Unlike the P2PK path, this path already swapped the
-            // proofs at the mint (wallet.receive above), so a replayed token's
+            // proofs at the mint (the receive above), so a replayed token's
             // proofs are spent and the mint rejects a second receive even during
             // a Redis outage. The mint is the backstop here, so failing open is
             // safe regardless of whether Redis is unconfigured or down.
@@ -1283,6 +1266,73 @@ pub async fn verify_cashu_token(
             Err(CashuError::Internal(format!("mint receive failed: {}", e)))
         }
     }
+}
+
+/// Receive a token in multi-tenant mode, mapping the proofs it produces.
+///
+/// `Wallet::receive` swaps a token's proofs at the mint for new ones and
+/// returns only the amount, so the mapping used to be keyed on the spent input
+/// proofs and matched nothing redemption later looked up: every tenant's funds
+/// went to `LNURL_ADDRESS`. This is the same swap, asking for the whole amount
+/// back: `swap` returns those proofs reserved, so each is mapped before it
+/// becomes spendable.
+async fn receive_for_tenant(
+    wallet: &cdk::wallet::Wallet,
+    token: &cdk::nuts::Token,
+    lnurl_addr: Option<String>,
+) -> Result<(), String> {
+    use cdk::amount::SplitTarget;
+    use cdk::nuts::nut00::ProofsMethods;
+    use cdk::nuts::State;
+    use cdk::types::ProofInfo;
+
+    let keysets = wallet.get_mint_keysets().await.map_err(|e| e.to_string())?;
+    let proofs = token.proofs(&keysets).map_err(|e| e.to_string())?;
+    let fee = wallet
+        .get_proofs_fee(&proofs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let amount = proofs
+        .total_amount()
+        .map_err(|e| e.to_string())?
+        .checked_sub(fee)
+        .ok_or("token does not cover the mint's input fee")?;
+
+    // As `receive_proofs` does: record the inputs, so a failed swap can reclaim them.
+    let inputs = proofs
+        .iter()
+        .cloned()
+        .map(|p| {
+            ProofInfo::new(
+                p,
+                wallet.mint_url.clone(),
+                State::Pending,
+                wallet.unit.clone(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    wallet
+        .localstore
+        .update_proofs(inputs, vec![])
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let received = wallet
+        .swap(Some(amount), SplitTarget::default(), proofs, None, false)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("mint swap returned no proofs")?;
+
+    if let Err(e) = set_proof_to_lnurl(received.clone(), lnurl_addr) {
+        warn!("⚠️ Failed to set proof-to-lnurl mapping: {}", e);
+    }
+
+    wallet
+        .localstore
+        .update_proofs_state(received.ys().map_err(|e| e.to_string())?, State::Unspent)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Verify Cashu token using P2PK optimized mode (NUT-24)
