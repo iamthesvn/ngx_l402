@@ -103,7 +103,7 @@ Fields:
 | `price_msat` | Effective price in millisatoshis. |
 | `price_source` | `static` (from `nginx.conf`) or `dynamic` (from Redis). |
 | `backend` | LN backend type snapshot: `LND`, `LNURL`, `NWC`, `CLN`, `BOLT12`, `ECLAIR`. |
-| `client_ip` | From `X-Real-IP` → `X-Forwarded-For` → socket address. |
+| `client_ip` | The connection's source address. Proxy headers are not trusted; configure nginx's realip module to substitute the real client address. |
 | `auth_state` | `missing`, `valid`, or `invalid`. |
 | `would_return` | HTTP status enforce mode *would* have used (`200`, `401`, `402`). |
 | `rate_limited` | `true` when `l402_invoice_rate_limit` would have produced a `429` — challenge synthesis was skipped to protect the LN backend. |
@@ -123,15 +123,22 @@ sudo tail -f /var/log/nginx/error.log \
 The `l402_metrics` directive turns a location into a Prometheus scrape
 endpoint. It serves counters in text exposition format v0.0.4.
 
+The shipped `nginx.conf` closes it to everything but localhost, because the
+counters carry invoice volume and revenue signals and that file ships inside the
+Docker image. Widen `allow` to reach it from your scrape host:
+
 ```nginx
 location = /metrics {
-    l402_metrics;
-
-    # Production: restrict to your scrape network.
-    allow 10.0.0.0/8;
+    allow 127.0.0.1;
+    allow ::1;
+    allow 10.0.0.0/8;      # your Prometheus host or monitoring subnet
     deny  all;
+    l402_metrics;
 }
 ```
+
+Scraping from another container puts the request on the Docker bridge, not
+loopback — allow that network rather than removing `deny all`.
 
 Scrape it with a standard Prometheus config:
 
