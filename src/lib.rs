@@ -2169,6 +2169,8 @@ pub unsafe extern "C" fn l402_access_handler_wrapper(request: *mut ngx_http_requ
         let challenge_caveats = binding.to_caveats();
         // Defense in depth: a panic from the LNURL library unwinding
         // through nginx's C stack is UB in a cdylib and crashes the worker.
+        // 2.3.4 propagates errors instead of panicking, but the dependency
+        // boundary isn't ours to trust, so the guard stays.
         // Backends bound connecting, not the call, so an unanswered request
         // would hold this worker until the client gave up. Generous because a
         // worker's first request builds its own channel: this catches a request

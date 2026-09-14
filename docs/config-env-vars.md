@@ -53,6 +53,8 @@ Environment=LNURL_ADDRESS=username@your-lnurl-server.com
 Environment=ROOT_KEY=your-root-key
 ```
 
+The username must match the LUD-16 charset (`a-z 0-9 - _ .`); addresses like `user+tag@example.com` are rejected since l402_middleware 2.3.4.
+
 ## NWC (Nostr Wallet Connect)
 
 ```bash
