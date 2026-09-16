@@ -85,7 +85,7 @@ which payment backends are accepted — without any out-of-band integration.
 | `payment_methods[].challenge_header` | constant `X-Cashu` | The header a `402` carries the Cashu payment request in (NUT-24). |
 | `routes[].path` | `location` directive | URL path served by this route. |
 | `routes[].price.amount_msat` | `l402_amount_msat_default` | Base price after `merge_loc_conf`. |
-| `routes[].caveats_required` | derived | Caveats the issued macaroon will carry: `RequestPath = <path>` (or `Realm = <name>` with `l402_realm`) and `RequestMethod = <METHOD>`, filled in with the request's method. |
+| `routes[].caveats_required` | derived | Caveats that bind the macaroon to the request: `RequestPath = <path>` (or `Realm = <name>` with `l402_realm`) and `RequestMethod = <METHOD>`, filled in with the request's method. With `l402_macaroon_timeout` set, the macaroon also carries `ExpiresAt`, given here as `macaroon_timeout_secs`. |
 | `routes[].macaroon_timeout_secs` | `l402_macaroon_timeout` | Omitted when `0` (no expiry). |
 | `routes[].lnurl_addr` | `l402_lnurl_addr` | Per-route LNURL override for multi-tenant deployments. |
 | `routes[].rate_limit` | `l402_invoice_rate_limit` | Server-side invoice rate limit applied before challenge issuance. |

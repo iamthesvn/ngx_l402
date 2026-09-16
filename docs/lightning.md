@@ -20,7 +20,7 @@ Configure the backend via the `LN_CLIENT_TYPE` environment variable:
 
 See [Environment Variables](./config-env-vars.md) for the full list of per-backend settings.
 
-Each worker connects to the backend on its first request, so an unreachable node does not stop nginx from starting. Until it is reachable, protected requests return `500`, counted in `l402_invoices_generation_errors_total`.
+Each worker connects to the backend on the first request that needs it, so an unreachable node does not stop nginx from starting. While it is down, requests that need a new invoice return `500` (counted in `l402_invoices_generation_errors_total`), and so do auto-detect retries whose preimage isn't cached in Redis. A full `macaroon:preimage` credential still verifies without the node.
 
 ---
 

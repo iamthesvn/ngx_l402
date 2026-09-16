@@ -100,7 +100,7 @@ The rate limit only applies to unauthenticated requests (those that would result
 | `<path>` | Dynamic price you set | Never — you manage it |
 | `lnurl:<path>` | Per-route LNURL override you set | Never — you manage it |
 | `l402:preimage:<sha256>` | Spent Lightning preimage | See [Replay Attack Prevention](#replay-attack-prevention) |
-| `l402:cashu_token:<sha256>` | Spent Cashu token | `L402_CASHU_TOKEN_TTL_SECONDS` |
+| `l402:cashu_token:<sha256>` | Spent Cashu token: a hash of the token, or in P2PK mode of its proofs, so a re-encoded token still matches | `L402_CASHU_TOKEN_TTL_SECONDS` |
 | `l402:settled:<payment hash>` | Settled preimage cached by auto-detect | `L402_PREIMAGE_TTL_SECONDS` |
 | `l402:invoice_rate:<sha256>` | Invoice rate-limit counter for a client and route | The rate-limit window |
 | `cashu:proof_lnurl:<sha256>` | Which tenant a Cashu proof belongs to | 20 redemption intervals — see [Multi-Tenant](./config-multi-tenant.md) |
