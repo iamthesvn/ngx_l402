@@ -1801,9 +1801,10 @@ unsafe fn send_html_response(r: *mut ngx_http_request_t, status: u16, body: Stri
 
 /// Send `status` with its already-attached headers and no body.
 ///
-/// A bare `return 402` is not bodyless: nginx's special-response handler fills
-/// in its built-in page for every 4xx. Marking the request header-only is what
-/// drops the body. Returns `NGX_DONE` for the reason `send_html_response` does.
+/// A bare `return 402` would get nginx's built-in error page. Sending the
+/// header ourselves avoids it; `Content-Length: 0` with nothing written keeps
+/// the body empty, and `header_only` ends the response after the header.
+/// Returns `NGX_DONE` for the reason `send_html_response` does.
 ///
 /// # Safety
 /// `r` must be the valid, non-null request pointer nginx passed to the handler.
