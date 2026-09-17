@@ -272,8 +272,8 @@ Environment=RUST_LOG=info
 # For module-specific debug logs:
 Environment=RUST_LOG=ngx_l402_lib=debug,info
 
-# Log per-request performance timing (set to any non-empty value to enable)
-Environment=L402_PERF_LOG=1
+# Log per-request performance timing at debug level (only `true` enables it)
+Environment=L402_PERF_LOG=true
 ```
 
 ---
