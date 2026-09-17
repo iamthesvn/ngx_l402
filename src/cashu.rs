@@ -236,16 +236,20 @@ fn resolve_wallet_mnemonic(db_url: &str) -> Result<(), String> {
 
     let file_path = wallet_mnemonic_file_path(db_url);
 
-    // Only reached when the phrase comes from a file. Setting
-    // CASHU_WALLET_MNEMONIC returns above, and is the way to have no file to
-    // attack at all.
+    // Only reached when the phrase comes from a file. The fingerprint's
+    // directory is checked where the fingerprint is read.
     if let Some(ref path) = file_path {
         warn_if_wallet_dir_is_shared(path);
     }
 
+    // A configured path may be a symlink, as Kubernetes secret mounts are;
+    // `ensure_owned` still checks its target. The derived default may not.
+    let configured =
+        std::env::var("CASHU_WALLET_MNEMONIC_FILE").is_ok_and(|p| !p.trim().is_empty());
+
     // 2. Previously persisted mnemonic.
     if let Some(ref path) = file_path {
-        if let Some(contents) = read_wallet_file(path)? {
+        if let Some(contents) = read_wallet_file(path, configured)? {
             let m = contents.trim().to_string();
             if ngx_l402_core::is_valid_mnemonic(&m) {
                 let _ = WALLET_MNEMONIC.set(m);
@@ -351,6 +355,15 @@ fn set_db_ownership(db_url: &str) {
                     continue;
                 }
             };
+
+            // A hard link can be another name for the root-owned phrase.
+            if !handle.metadata().is_ok_and(|m| m.nlink() == 1) {
+                warn!(
+                    "⚠️ Not adjusting ownership of {}: it has other hard links",
+                    file.display()
+                );
+                continue;
+            }
 
             if let Some((uid, gid)) = owner {
                 let _ = std::os::unix::fs::fchown(&handle, Some(uid), Some(gid));
@@ -470,7 +483,9 @@ fn check_wallet_fingerprint(db_url: &str) -> Result<(), String> {
         return Ok(());
     };
 
-    match read_wallet_file(&path)? {
+    warn_if_wallet_dir_is_shared(&path);
+
+    match read_wallet_file(&path, false)? {
         Some(stored) if stored.trim() == fingerprint => Ok(()),
         Some(stored) => Err(format!(
             "CASHU_WALLET_MNEMONIC does not match the wallet that owns this database \
@@ -505,7 +520,7 @@ fn wallet_fingerprint_file_path(db_url: &str) -> Option<String> {
     )
 }
 
-/// Warn if a user other than this one could delete or rename the mnemonic.
+/// Warn if a user other than this one could delete or rename a wallet file.
 ///
 /// `read_wallet_file` refuses a phrase this process doesn't own, so no one else
 /// can substitute one. But POSIX lets whoever can write a directory unlink or
@@ -516,10 +531,10 @@ fn wallet_fingerprint_file_path(db_url: &str) -> Option<String> {
 ///
 /// Runs in the master before workers fork, so `geteuid` is the trusted user.
 #[cfg(unix)]
-fn warn_if_wallet_dir_is_shared(mnemonic_path: &str) {
+fn warn_if_wallet_dir_is_shared(path: &str) {
     use std::os::unix::fs::MetadataExt;
 
-    let Some(parent) = std::path::Path::new(mnemonic_path).parent() else {
+    let Some(parent) = std::path::Path::new(path).parent() else {
         return;
     };
     let dir = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
@@ -536,12 +551,11 @@ fn warn_if_wallet_dir_is_shared(mnemonic_path: &str) {
         let foreign_owner = md.uid() != me && md.uid() != 0;
         if others_can_write || foreign_owner {
             warn!(
-                "⚠️ The Cashu wallet mnemonic at {} can be deleted or renamed by another \
-                 user: {} is writable by a user other than this process (owner uid={}, \
+                "⚠️ The Cashu wallet file {} can be deleted or renamed by another user: \
+                 {} is writable by a user other than this process (owner uid={}, \
                  mode={:o}; we are uid={}). Make that directory root-owned and sticky \
-                 (chown root:<worker group>, chmod 1770), set CASHU_WALLET_MNEMONIC, or \
-                 point CASHU_WALLET_MNEMONIC_FILE at a directory only this user can write.",
-                mnemonic_path,
+                 (chown root:<worker group>, chmod 1770).",
+                path,
                 ancestor.display(),
                 md.uid(),
                 mode & 0o7777,
@@ -553,7 +567,7 @@ fn warn_if_wallet_dir_is_shared(mnemonic_path: &str) {
 }
 
 #[cfg(not(unix))]
-fn warn_if_wallet_dir_is_shared(_mnemonic_path: &str) {}
+fn warn_if_wallet_dir_is_shared(_path: &str) {}
 
 /// Persist the wallet fingerprint beside the database.
 ///
@@ -590,9 +604,9 @@ fn persist_fingerprint(path: &str, fingerprint: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Read a wallet file, `None` if it does not exist. Refuses a symlink, and on
-/// unix anything `ensure_owned` rejects.
-fn read_wallet_file(path: &str) -> Result<Option<String>, String> {
+/// Read a wallet file, `None` if it does not exist. Refuses a symlink unless
+/// `follow_symlink`, and on unix anything `ensure_owned` rejects.
+fn read_wallet_file(path: &str, follow_symlink: bool) -> Result<Option<String>, String> {
     use std::io::Read;
 
     #[cfg(unix)]
@@ -600,11 +614,14 @@ fn read_wallet_file(path: &str) -> Result<Option<String>, String> {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(if follow_symlink { 0 } else { libc::O_NOFOLLOW })
             .open(path)
     };
     #[cfg(not(unix))]
-    let opened = std::fs::File::open(path);
+    let opened = {
+        let _ = follow_symlink;
+        std::fs::File::open(path)
+    };
 
     let mut file = match opened {
         Ok(file) => file,

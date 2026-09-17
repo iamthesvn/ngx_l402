@@ -54,7 +54,9 @@ RUN printf '%s\n' \
     'if [ "$(stat -c %U "$d")" != root ]; then' \
     '  chown -h root:root "$d/wallet.mnemonic" "$d/wallet.fingerprint" 2>/dev/null' \
     'fi' \
-    'find "$d" -mindepth 1 ! -name wallet.mnemonic ! -name wallet.fingerprint -exec chown -h nginx:nginx {} + || exit 1' \
+    '# Only the database files nginx writes, and no hard link: one can be another' \
+    '# name for the root-owned phrase.' \
+    'find "$d" -maxdepth 1 -name "$(basename "${CASHU_DB_PATH:-/app/data/cashu_tokens.db}")*" -links 1 -exec chown -h nginx:nginx {} + || exit 1' \
     'chown root:nginx "$d" && chmod 1770 "$d"' \
     > /docker-entrypoint.d/05-cashu-data-perms.sh \
     && chmod +x /docker-entrypoint.d/05-cashu-data-perms.sh
