@@ -72,11 +72,15 @@ The username must match the LUD-16 charset (`a-z 0-9 - _ .`); addresses like `us
 
 ## NWC (Nostr Wallet Connect)
 
+NWC receives payments too: the wallet creates each invoice and is paid directly, no node needed.
+
 ```bash
 Environment=LN_CLIENT_TYPE=NWC
 Environment=NWC_URI=nostr+walletconnect://<pubkey>?relay=<relay_url>&secret=<secret>
 Environment=ROOT_KEY=your-root-key
 ```
+
+Grant the connection `make_invoice`, plus `lookup_invoice` for auto-detect. It never pays, so leave the spending permissions off. The wallet must return `payment_hash` in its `make_invoice` reply.
 
 ## BOLT12 (Reusable Offers)
 

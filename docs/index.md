@@ -11,7 +11,7 @@ It supports the following Lightning backends:
 | **CLN** | Core Lightning |
 | **Eclair** | Eclair node |
 | **LNURL** | Lightning Network URL |
-| **NWC** | Nostr Wallet Connect |
+| **NWC** | Nostr Wallet Connect — receive into any NWC wallet |
 | **BOLT12** | Reusable Lightning Offers |
 
 The module can be configured to charge per unique API call, enabling per-endpoint monetization based on request paths.

@@ -15,7 +15,7 @@ Configure the backend via the `LN_CLIENT_TYPE` environment variable:
 | `CLN` | Core Lightning |
 | `ECLAIR` | Eclair node |
 | `LNURL` | Lightning Network URL — delegate invoice generation to an LNURL server |
-| `NWC` | Nostr Wallet Connect |
+| `NWC` | Nostr Wallet Connect — receive into any NWC wallet, no node needed |
 | `BOLT12` | Reusable Lightning Offers (BOLT12) |
 
 See [Environment Variables](./config-env-vars.md) for the full list of per-backend settings.

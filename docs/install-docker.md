@@ -81,6 +81,8 @@ docker run -d \
 
 ### 5. NWC Backend (Nostr Wallet Connect)
 
+Receives into your NWC wallet; the connection needs only `make_invoice` (plus `lookup_invoice` for auto-detect), no spending permissions.
+
 ```bash
 docker run -d \
   --name l402-nginx \
