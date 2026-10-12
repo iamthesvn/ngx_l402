@@ -8,13 +8,16 @@ pub mod content {
     tonic::include_proto!("content");
 }
 
-// Include the file descriptor set for reflection
-pub mod content_descriptor {
-    include!(concat!(env!("OUT_DIR"), "/content_descriptor.rs"));
-}
-
 use content::content_service_server::{ContentService, ContentServiceServer};
 use content::{ContentRequest, ContentResponse};
+
+fn unix_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string()
+}
 
 #[derive(Default)]
 pub struct ContentServiceImpl {}
@@ -26,11 +29,7 @@ impl ContentService for ContentServiceImpl {
         request: Request<ContentRequest>,
     ) -> Result<Response<ContentResponse>, Status> {
         let req = request.into_inner();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
+        let timestamp = unix_timestamp();
 
         let response = ContentResponse {
             title: format!("Content for path: {}", req.path),
@@ -46,11 +45,7 @@ impl ContentService for ContentServiceImpl {
         &self,
         _request: Request<ContentRequest>,
     ) -> Result<Response<ContentResponse>, Status> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
+        let timestamp = unix_timestamp();
 
         let response = ContentResponse {
             title: "This is Protected Content".to_string(),
@@ -66,11 +61,7 @@ impl ContentService for ContentServiceImpl {
         &self,
         _request: Request<ContentRequest>,
     ) -> Result<Response<ContentResponse>, Status> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
+        let timestamp = unix_timestamp();
 
         let response = ContentResponse {
             title: "Free Content".to_string(),
@@ -95,7 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🚀 gRPC content server listening on {}", addr);
 
     let reflection_service = ReflectionBuilder::configure()
-        .register_encoded_file_descriptor_set(&content_descriptor::FILE_DESCRIPTOR_SET[..])
+        .register_encoded_file_descriptor_set(tonic::include_file_descriptor_set!(
+            "content_descriptor"
+        ))
         .build()?;
 
     info!("✅ gRPC server configured, starting to serve...");
