@@ -1284,7 +1284,7 @@ pub fn initialize_p2pk_mode() -> Result<(), String> {
         .map_err(|_| "Failed to set public key".to_string())?;
 
     let _ = P2PK_MODE_ENABLED.set(true);
-    // Prime the cached policy so the first request doesn't read the env.
+    // Must be read here in the master: workers have no environment.
     let _ = cashu_require_dleq();
     info!("✅ P2PK mode initialized with public key");
 
