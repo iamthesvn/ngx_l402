@@ -5,15 +5,26 @@
 //! proof was actually signed by the (whitelisted) mint (see issue #117).
 
 use cdk::nuts::{Proof, PublicKey};
-use log::warn;
 
 /// Parse the `CASHU_REQUIRE_DLEQ` value: only an explicit, case-insensitive
 /// "false" disables the check; anything else (unset, empty, "true", garbage)
 /// keeps it on.
 pub fn parse_require_dleq(value: Option<&str>) -> bool {
     value
-        .map(|v| v.trim().to_lowercase() != "false")
+        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true)
+}
+
+/// Outcome of [`verify_proof_dleq_offline`] when the proof is admitted.
+/// Logging belongs to the caller: core returns what happened, the binary
+/// decides how (and under which log target) to report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DleqCheck {
+    /// The proof carried DLEQ data and it verified against the mint key.
+    Verified,
+    /// The proof carried no DLEQ data and `CASHU_REQUIRE_DLEQ=false` admitted
+    /// it anyway — no offline mint-signature verification happened (insecure).
+    AdmittedWithoutDleq,
 }
 
 /// Verify a single proof's NUT-12 DLEQ against the per-amount mint key,
@@ -30,7 +41,7 @@ pub fn verify_proof_dleq_offline(
     proof: &Proof,
     amount_key: Option<PublicKey>,
     require_dleq: bool,
-) -> Result<(), String> {
+) -> Result<DleqCheck, String> {
     match proof.dleq {
         Some(_) => {
             let key = amount_key.ok_or_else(|| {
@@ -41,7 +52,8 @@ pub fn verify_proof_dleq_offline(
             })?;
             proof
                 .verify_dleq(key)
-                .map_err(|e| format!("NUT-12 DLEQ verification failed: {}", e))
+                .map_err(|e| format!("NUT-12 DLEQ verification failed: {}", e))?;
+            Ok(DleqCheck::Verified)
         }
         None => {
             if require_dleq {
@@ -51,11 +63,7 @@ pub fn verify_proof_dleq_offline(
                         .to_string(),
                 )
             } else {
-                warn!(
-                    "⚠️ Proof missing DLEQ and CASHU_REQUIRE_DLEQ=false — admitting \
-                     without offline mint-signature verification (insecure)"
-                );
-                Ok(())
+                Ok(DleqCheck::AdmittedWithoutDleq)
             }
         }
     }
@@ -72,6 +80,10 @@ mod tests {
 
     // The mint public key `A` that signed the proof above.
     const MINT_KEY_HEX: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    // A valid secp256k1 public key that did NOT sign the proof.
+    const OTHER_KEY_HEX: &str =
+        "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
 
     fn mint_key() -> PublicKey {
         PublicKey::from_str(MINT_KEY_HEX).unwrap()
@@ -91,30 +103,62 @@ mod tests {
     fn dleq_offline_accepts_valid_proof() {
         let proof: Proof = serde_json::from_str(VALID_PROOF_JSON).unwrap();
         // Valid DLEQ + correct per-amount key -> admitted.
-        assert!(verify_proof_dleq_offline(&proof, Some(mint_key()), true).is_ok());
+        assert_eq!(
+            verify_proof_dleq_offline(&proof, Some(mint_key()), true),
+            Ok(DleqCheck::Verified)
+        );
     }
 
     #[test]
     fn dleq_offline_rejects_tampered_c() {
-        // Simulate a forger: a proof from a whitelisted mint, P2PK-shaped, but
-        // whose unblinded signature C does not match the mint's DLEQ. Today
-        // (pre-#117) this would be admitted on the fast path; it must be rejected.
+        // A proof from a whitelisted mint, P2PK-shaped, but whose unblinded
+        // signature C does not match the mint's DLEQ must be rejected.
         let mut proof: Proof = serde_json::from_str(VALID_PROOF_JSON).unwrap();
-        proof.c = PublicKey::from_str(
-            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
-        )
-        .unwrap();
+        proof.c = PublicKey::from_str(OTHER_KEY_HEX).unwrap();
         let err = verify_proof_dleq_offline(&proof, Some(mint_key()), true)
             .expect_err("tampered C must be rejected");
-        assert!(err.contains("DLEQ"), "unexpected error: {}", err);
+        assert!(
+            err.starts_with("NUT-12 DLEQ verification failed"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
-    fn dleq_offline_rejects_wrong_amount_key() {
+    fn dleq_offline_rejects_missing_amount_key() {
         // DLEQ present but we couldn't resolve the per-amount key -> reject,
         // never silently admit.
         let proof: Proof = serde_json::from_str(VALID_PROOF_JSON).unwrap();
         assert!(verify_proof_dleq_offline(&proof, None, true).is_err());
+    }
+
+    #[test]
+    fn dleq_offline_rejects_wrong_key() {
+        // DLEQ present and a key was resolved, but it is not the key that
+        // signed the proof -> the cryptographic check must fail.
+        let proof: Proof = serde_json::from_str(VALID_PROOF_JSON).unwrap();
+        let other = PublicKey::from_str(OTHER_KEY_HEX).unwrap();
+        let err = verify_proof_dleq_offline(&proof, Some(other), true)
+            .expect_err("wrong key must be rejected");
+        assert!(
+            err.starts_with("NUT-12 DLEQ verification failed"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn dleq_offline_policy_off_still_verifies_present_dleq() {
+        // CASHU_REQUIRE_DLEQ=false only relaxes the *missing*-DLEQ case; a
+        // proof that carries DLEQ is still cryptographically verified.
+        let mut tampered: Proof = serde_json::from_str(VALID_PROOF_JSON).unwrap();
+        tampered.c = PublicKey::from_str(OTHER_KEY_HEX).unwrap();
+        assert!(verify_proof_dleq_offline(&tampered, Some(mint_key()), false).is_err());
+
+        // DLEQ present but the key can't be resolved: fail closed even with
+        // the policy off.
+        let valid: Proof = serde_json::from_str(VALID_PROOF_JSON).unwrap();
+        assert!(verify_proof_dleq_offline(&valid, None, false).is_err());
     }
 
     #[test]
@@ -125,6 +169,9 @@ mod tests {
         // require_dleq = true -> reject DLEQ-less proof.
         assert!(verify_proof_dleq_offline(&proof, None, true).is_err());
         // require_dleq = false -> admit (safety valve).
-        assert!(verify_proof_dleq_offline(&proof, None, false).is_ok());
+        assert_eq!(
+            verify_proof_dleq_offline(&proof, None, false),
+            Ok(DleqCheck::AdmittedWithoutDleq)
+        );
     }
 }

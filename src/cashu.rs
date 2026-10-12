@@ -24,7 +24,7 @@ thread_local! {
 
 // MSAT_PER_SAT: single definition, shared with `sat_to_msat` so the two can
 // never disagree.
-use ngx_l402_core::{parse_require_dleq, verify_proof_dleq_offline, MSAT_PER_SAT};
+use ngx_l402_core::{parse_require_dleq, verify_proof_dleq_offline, DleqCheck, MSAT_PER_SAT};
 
 // Database singleton using cdk-sqlite. Opened in the master; `CASHU_DB_PID`
 // records who opened it so a forked worker knows to open its own instead of
@@ -1284,9 +1284,8 @@ pub fn initialize_p2pk_mode() -> Result<(), String> {
         .map_err(|_| "Failed to set public key".to_string())?;
 
     let _ = P2PK_MODE_ENABLED.set(true);
-    let _ = CASHU_REQUIRE_DLEQ.set(parse_require_dleq(
-        std::env::var("CASHU_REQUIRE_DLEQ").ok().as_deref(),
-    ));
+    // Prime the cached policy so the first request doesn't read the env.
+    let _ = cashu_require_dleq();
     info!("✅ P2PK mode initialized with public key");
 
     Ok(())
@@ -1841,8 +1840,14 @@ pub async fn verify_cashu_token_p2pk(
         } else {
             None
         };
-        verify_proof_dleq_offline(proof, amount_key, require_dleq)
-            .map_err(CashuError::BadCredential)?;
+        match verify_proof_dleq_offline(proof, amount_key, require_dleq) {
+            Ok(DleqCheck::Verified) => {}
+            Ok(DleqCheck::AdmittedWithoutDleq) => warn!(
+                "⚠️ Proof missing DLEQ and CASHU_REQUIRE_DLEQ=false — admitting \
+                 without offline mint-signature verification (insecure)"
+            ),
+            Err(e) => return Err(CashuError::BadCredential(e)),
+        }
     }
     info!(
         "✅ All {} proofs passed NUT-12 DLEQ verification",

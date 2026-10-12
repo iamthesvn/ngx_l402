@@ -24,7 +24,7 @@ mod replay_cache;
 mod wallet_seed;
 
 pub use cashu_error::CashuError;
-pub use dleq::{parse_require_dleq, verify_proof_dleq_offline};
+pub use dleq::{parse_require_dleq, verify_proof_dleq_offline, DleqCheck};
 pub use escaping::{escape_json, html_escape};
 pub use fast_exit::install_fast_exit;
 pub use fee::{fee_reserve_msat, melt_reserve_msat, sat_to_msat, MSAT_PER_SAT};
