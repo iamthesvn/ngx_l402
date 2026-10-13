@@ -734,7 +734,7 @@ jobs:
         run: |
           echo "Testing SOCKS5 proxy connectivity..."
           # Test if Tor SOCKS5 proxy is accessible
-          curl --socks5-hostname 127.0.0.1:9050 http://example.com > /dev/null 2>&1 && \
+          curl --socks5-hostname 127.0.0.1:9050 --max-time 10 http://example.com > /dev/null 2>&1 && \
             echo "✓ SOCKS5 proxy is working" || \
             echo "⚠ SOCKS5 proxy test failed (may be expected in CI environment)"
           # Check if Tor is running
