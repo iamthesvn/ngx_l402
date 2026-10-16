@@ -110,6 +110,12 @@ http {
         listen 8001;
         location /alby  { l402 on; l402_amount_msat_default 10000; l402_tenant_ref alby; }
         location /ghost { l402 on; l402_amount_msat_default 10000; l402_tenant_ref ghost; }
+        location /legacy {
+            l402 on; l402_amount_msat_default 10000; l402_lnurl_addr hello@getalby.com;
+            location /legacy/child    { l402 on; }
+            location /legacy/override { l402 on; l402_lnurl_addr other@getalby.com; }
+        }
+        location = /.well-known/l402-services { l402_manifest; }
     }
 }'
 printf '%s\n' "$routing_conf" | docker exec -i "$container" sh -c 'cat > /tmp/tenant-routing.conf'
@@ -127,6 +133,18 @@ if head -n1 <<<"$alby" | grep -q ' 402' && grep -qi '^WWW-Authenticate: L402 .*i
 else
     echo "  ✗ /alby: expected 402 with an L402 invoice, got:"
     sed 's/^/      /' <<<"$alby"
+    failures=$((failures + 1))
+fi
+
+# The manifest shows each route's post-merge address. `l402_lnurl_addr`
+# inheritance shares its merge branch with tenant refs, so pin it here.
+routes=$(fetch /.well-known/l402-services | sed -n '/^{/,$p' |
+    jq -r '.routes[] | "\(.path)=\(.lnurl_addr)"' | sort | tr '\n' ' ')
+want="/alby=hello@getalby.com /ghost=nobody@ngx-l402.invalid /legacy/child=hello@getalby.com /legacy/override=other@getalby.com /legacy=hello@getalby.com "
+if [ "$routes" = "$want" ]; then
+    echo "  ✓ every route reports the address it inherits or sets"
+else
+    echo "  ✗ manifest addresses: got '$routes', want '$want'"
     failures=$((failures + 1))
 fi
 
