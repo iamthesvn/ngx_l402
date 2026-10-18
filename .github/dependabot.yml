@@ -4,6 +4,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # `cdk` and the `cdk-*` crates all pin `cdk-common` to an exact version,
+      # so they must bump together — a PR updating only one of them won't build.
+      cdk:
+        patterns:
+          - "cdk"
+          - "cdk-*"
 
   # grpc-server is a standalone crate (excluded from the root workspace).
   - package-ecosystem: cargo
