@@ -111,6 +111,15 @@ fn tenant_registry() -> &'static std::sync::Mutex<ngx_l402_core::TenantRegistry>
     TENANT_REGISTRY.get_or_init(Default::default)
 }
 
+/// Where each `l402_lnurl_addr` whose Cashu goes to the operator was written,
+/// in parse order. `merge` adds each site once, and postconfiguration reports
+/// them in one warning instead of one per location.
+static CASHU_TO_OPERATOR: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+
+fn cashu_to_operator() -> &'static std::sync::Mutex<Vec<String>> {
+    CASHU_TO_OPERATOR.get_or_init(Default::default)
+}
+
 /// How to reach Redis, recorded at startup. Pool size is configurable via
 /// REDIS_POOL_SIZE (default: cpu_count * 3, min 5, max 50).
 static REDIS_URL: OnceLock<String> = OnceLock::new();
@@ -1237,6 +1246,10 @@ impl HttpModule for L402Module {
         if let Ok(mut reg) = tenant_registry().lock() {
             reg.clear();
         }
+        // A parse that failed before postconfiguration leaves its sites behind.
+        if let Ok(mut sites) = cashu_to_operator().lock() {
+            sites.clear();
+        }
         NGX_OK as ngx_int_t
     }
 
@@ -1257,6 +1270,22 @@ impl HttpModule for L402Module {
         // Register the cross-worker metrics shared-memory zone. Failure is
         // non-fatal: metrics fall back to per-worker counters (issue #105).
         register_metrics_shm(cf);
+
+        // Every location is merged by now.
+        let sites = std::mem::take(
+            &mut *cashu_to_operator()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if !sites.is_empty() {
+            let backend = std::env::var("LN_CLIENT_TYPE").unwrap_or_else(|_| "LNURL".to_string());
+            eprintln!(
+                "ngx_l402: l402_lnurl_addr at {} sends Lightning to that address, but with \
+                 LN_CLIENT_TYPE={backend} Cashu paid on those routes is redeemed to the \
+                 operator. Per-route Cashu payouts need LN_CLIENT_TYPE=LNURL.",
+                sites.join(", ")
+            );
+        }
 
         NGX_OK as ngx_int_t
     }
@@ -1393,6 +1422,10 @@ pub struct ModuleConfig {
     // Name given to `l402_tenant_ref`. `merge` resolves it into `lnurl_addr`,
     // so everything downstream sees an address exactly as with `l402_lnurl_addr`.
     tenant_ref: Option<String>,
+    // "file:line" of this location's `l402_lnurl_addr` or `l402_tenant_ref`,
+    // or of the parent's when inherited with it. `merge` runs after nginx has
+    // left the line, so its errors would otherwise not say where they are.
+    lnurl_at: Option<String>,
     // (max_requests, window_secs): e.g. (5, 60) means 5 invoices per minute per IP per route.
     // None means rate limiting is disabled for this location.
     invoice_rate_limit: Option<(u32, u64)>,
@@ -1644,10 +1677,12 @@ impl Merge for ModuleConfig {
         // parses all of `http {}` before merging, so a tenant may be defined
         // after the location that references it.
         if let Some(id) = self.tenant_ref.as_deref() {
+            // Both setters record `lnurl_at`, so it is set whenever a ref is.
+            let at = self.lnurl_at.as_deref().unwrap_or_default();
             if self.lnurl_addr.is_some() {
                 eprintln!(
-                    "ngx_l402: l402_tenant_ref \"{id}\" and l402_lnurl_addr are both set in \
-                     one location; keep one."
+                    "ngx_l402: {at}: l402_tenant_ref \"{id}\" and l402_lnurl_addr are both \
+                     set in one location; keep one."
                 );
                 return Err(MergeConfigError::NoValue);
             }
@@ -1657,13 +1692,14 @@ impl Merge for ModuleConfig {
             match registry.resolve(id) {
                 Ok(tenant) => self.lnurl_addr = Some(tenant.lnurl_addr.clone()),
                 Err(e) => {
-                    eprintln!("ngx_l402: l402_tenant_ref: {e}");
+                    eprintln!("ngx_l402: {at}: l402_tenant_ref: {e}");
                     return Err(MergeConfigError::NoValue);
                 }
             }
         } else if self.lnurl_addr.is_none() {
             self.lnurl_addr = prev.lnurl_addr.clone();
             self.tenant_ref = prev.tenant_ref.clone();
+            self.lnurl_at = prev.lnurl_at.clone();
         }
         if self.realm.is_none() && prev.realm.is_some() {
             self.realm = prev.realm.clone();
@@ -1720,20 +1756,25 @@ impl Merge for ModuleConfig {
         // starting.
         let backend = std::env::var("LN_CLIENT_TYPE").unwrap_or_else(|_| "LNURL".to_string());
         if self.enable && self.lnurl_addr.is_some() && cashu_on && backend != "LNURL" {
+            // Read after the destination is merged, so an inherited address
+            // reports the parent's line rather than none.
+            let at = self.lnurl_at.clone().unwrap_or_default();
             if let Some(id) = &self.tenant_ref {
                 eprintln!(
-                    "ngx_l402: l402_tenant_ref \"{id}\" needs LN_CLIENT_TYPE=LNURL while \
+                    "ngx_l402: {at}: l402_tenant_ref \"{id}\" needs LN_CLIENT_TYPE=LNURL while \
                      CASHU_ECASH_SUPPORT is on. With LN_CLIENT_TYPE={backend}, Cashu paid on \
                      this route is redeemed to the operator, not the tenant."
                 );
                 return Err(MergeConfigError::NoValue);
             }
-            eprintln!(
-                "ngx_l402: l402_lnurl_addr sends Lightning to {}, but with \
-                 LN_CLIENT_TYPE={backend} Cashu paid on this route is redeemed to the \
-                 operator. Per-route Cashu payouts need LN_CLIENT_TYPE=LNURL.",
-                self.lnurl_addr.as_deref().unwrap_or_default()
-            );
+            // Nested locations inherit the site with the address, so each
+            // directive is listed once however many locations it reaches.
+            let mut sites = cashu_to_operator()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !sites.contains(&at) {
+                sites.push(at);
+            }
         }
         // NUT-24's `a` is a whole number of sats, so a sub-sat price is
         // advertised rounded up while Lightning still charges it exactly. Not
@@ -4066,10 +4107,27 @@ pub unsafe extern "C" fn ngx_http_l402_lnurl_set(
         };
 
         conf.lnurl_addr = Some(lnurl_addr.clone());
+        conf.lnurl_at = Some(conf_position(cf));
         info!("Set L402 LNURL address to: {}", lnurl_addr);
     }
 
     std::ptr::null_mut()
+}
+
+/// The "file:line" nginx is reading, as it prints them in its own errors.
+///
+/// # Safety
+/// `cf` is the valid pointer nginx passes to a directive handler.
+unsafe fn conf_position(cf: *mut ngx_conf_t) -> String {
+    // SAFETY: nginx sets `conf_file` before calling any directive handler.
+    unsafe {
+        let file = &*(*cf).conf_file;
+        format!(
+            "{}:{}",
+            file.file.name.to_str().unwrap_or_default(),
+            file.line
+        )
+    }
 }
 
 /// Copy `msg` into the config pool as a C string for a directive handler to
@@ -4149,6 +4207,7 @@ pub unsafe extern "C" fn ngx_http_l402_tenant_ref_set(
             return c"needs a tenant name".as_ptr() as *mut c_char;
         }
         conf.tenant_ref = Some(id.to_string());
+        conf.lnurl_at = Some(conf_position(cf));
     }
     std::ptr::null_mut()
 }

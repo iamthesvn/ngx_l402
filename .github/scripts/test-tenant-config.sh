@@ -22,6 +22,8 @@ wrap() {
 # Runs `nginx -t` on the config with the given environment overrides and checks
 # the outcome. <pattern> must appear in the output either way; for ok cases
 # that is how a warning is asserted, and "successful" does for a clean load.
+# The body starts on line 4 of the config, so its first line is blank and its
+# first directive is on line 5.
 expect() {
     local want=$1 name=$2 pattern=$3 body=$4
     shift 4
@@ -59,8 +61,8 @@ expect ok "a child l402_lnurl_addr replaces the parent tenant" "successful" '
     server { listen 8001; location /a { l402_tenant_ref alice;
         location /a/b { l402 on; l402_lnurl_addr bob@example.org; } } }'
 
-expect fail "an unknown tenant names the ones that exist" \
-    'tenant "carol" is not defined; defined tenants: alice, bob' '
+expect fail "an unknown tenant names the ones that exist, and where it was referenced" \
+    'tenant-test.conf:7: l402_tenant_ref: tenant "carol" is not defined; defined tenants: alice, bob' '
     l402_tenant alice lnurl=alice@getalby.com;
     l402_tenant bob lnurl=bob@example.org;
     server { listen 8001; location /c { l402 on; l402_tenant_ref carol; } }'
@@ -75,14 +77,23 @@ expect fail "a misspelt key is refused" 'unknown key "lnrul"' '
 expect fail "l402_tenant is http-level only" '"l402_tenant" directive is not allowed here' '
     server { listen 8001; location /a { l402_tenant alice lnurl=alice@getalby.com; } }'
 
-expect fail "a tenant and an address in one location are refused" "are both set in one location" '
+expect fail "a tenant and an address in one location are refused" \
+    'tenant-test.conf:7: l402_tenant_ref "alice" and l402_lnurl_addr are both set in one location' '
     l402_tenant alice lnurl=alice@getalby.com;
     server { listen 8001; location /a { l402 on; l402_tenant_ref alice;
         l402_lnurl_addr bob@example.org; } }'
 
-expect fail "a tenant on a node backend with Cashu on is refused" "needs LN_CLIENT_TYPE=LNURL" '
+expect fail "a tenant on a node backend with Cashu on is refused" \
+    'tenant-test.conf:6: l402_tenant_ref "alice" needs LN_CLIENT_TYPE=LNURL' '
     l402_tenant alice lnurl=alice@getalby.com;
     server { listen 8001; location /a { l402 on; l402_tenant_ref alice; } }' \
+    LN_CLIENT_TYPE=LND CASHU_ECASH_SUPPORT=true
+
+expect fail "an inherited tenant on a node backend is refused at the parent's line" \
+    'tenant-test.conf:6: l402_tenant_ref "alice" needs LN_CLIENT_TYPE=LNURL' '
+    l402_tenant alice lnurl=alice@getalby.com;
+    server { listen 8001; location /a { l402_tenant_ref alice;
+        location /a/b { l402 on; } } }' \
     LN_CLIENT_TYPE=LND CASHU_ECASH_SUPPORT=true
 
 expect ok "a tenant on a node backend without Cashu loads" "successful" '
@@ -90,9 +101,13 @@ expect ok "a tenant on a node backend without Cashu loads" "successful" '
     server { listen 8001; location /a { l402 on; l402_tenant_ref alice; } }' \
     LN_CLIENT_TYPE=LND CASHU_ECASH_SUPPORT=false
 
-expect ok "l402_lnurl_addr on a node backend with Cashu on only warns" \
-    "Cashu paid on this route is redeemed to the operator" '
-    server { listen 8001; location /a { l402 on; l402_lnurl_addr bob@example.org; } }' \
+# One warning lists each directive once: /a/b inherits /a's address and must
+# not add a second entry for line 6.
+expect ok "l402_lnurl_addr on a node backend with Cashu on warns once, naming each site" \
+    'l402_lnurl_addr at /tmp/tenant-test.conf:6, /tmp/tenant-test.conf:7 sends Lightning to that address, but with LN_CLIENT_TYPE=LND Cashu paid on those routes is redeemed to the operator' '
+    server { listen 8001;
+        location /a { l402 on; l402_lnurl_addr bob@example.org; location /a/b { l402 on; } }
+        location /c { l402 on; l402_lnurl_addr carol@example.org; } }' \
     LN_CLIENT_TYPE=LND CASHU_ECASH_SUPPORT=true
 
 # A ref must pay the tenant's own address, not fall back to LNURL_ADDRESS.
