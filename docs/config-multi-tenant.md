@@ -47,6 +47,7 @@ A location that sets neither `l402_tenant_ref` nor `l402_lnurl_addr` inherits it
 
 nginx refuses to start when:
 
+- an `l402_tenant` name uses anything but letters, digits, `-` and `_`, or the line is missing `lnurl=`, gives a key other than `lnurl`, repeats a key, or leaves a value empty.
 - `l402_tenant_ref` names a tenant that no `l402_tenant` defines. The error lists the tenants that are defined.
 - two `l402_tenant` lines use the same name.
 - one location sets both `l402_tenant_ref` and `l402_lnurl_addr`.

@@ -112,7 +112,8 @@ expect ok "l402_lnurl_addr on a node backend with Cashu on warns once, naming ea
 
 # A ref must pay the tenant's own address, not fall back to LNURL_ADDRESS.
 # `ghost` points at a domain that cannot resolve: if it fell back, it would
-# get a working invoice from the global address like `alby` does.
+# get a working invoice from the global address like `alby` does, and if it
+# used its own it fails with that address in the log.
 echo "Routing checks:"
 routing_conf='pid /tmp/tenant-routing.pid;
 error_log /tmp/tenant-routing.log notice;
@@ -163,9 +164,17 @@ else
     failures=$((failures + 1))
 fi
 
+# Only the request path logs these two lines; the startup pre-warm of the same
+# address logs its own, so a failed pre-warm cannot satisfy the check.
 ghost=$(fetch /ghost)
 if grep -qi '^WWW-Authenticate: L402' <<<"$ghost"; then
     echo "  ✗ /ghost was issued an invoice, so it did not use its tenant's address:"
+    sed 's/^/      /' <<<"$ghost"
+    failures=$((failures + 1))
+elif ! docker exec "$container" grep -qE \
+    'Error (getting LNURL client for|generating invoice via LNURL) nobody@ngx-l402\.invalid' \
+    /tmp/tenant-routing.log; then
+    echo "  ✗ /ghost got no invoice, but not because its tenant's address failed:"
     sed 's/^/      /' <<<"$ghost"
     failures=$((failures + 1))
 else
